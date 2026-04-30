@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-trader-backend"
+version = "0.1.0"
+description = "Minimal Alpaca paper trading backend with OpenAI integration."
+requires-python = ">=3.11"
+dependencies = [
+  "alpaca-py>=0.42.0",
+  "fastapi>=0.116.0",
+  "httpx>=0.28.0",
+  "openai>=1.68.0",
+  "pytest",
+  "pytz>=2024.1",
+  "python-dotenv>=1.0.1",
+  "uvicorn>=0.35.0",
+]
+
+[tool.setuptools]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+  "integration: real client integration tests",
+]
