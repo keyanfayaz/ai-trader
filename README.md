@@ -48,7 +48,7 @@ Core backend vars:
 - `ALPACA_REAL_API_KEY`
 - `ALPACA_REAL_SECRET_KEY`
 - `ALPACA_REAL_BASE_URL` (live endpoint, default `https://api.alpaca.markets`)
-- `TRADING_MODE` (`paper` or `real`, default `paper`; persisted in runtime config after mode changes)
+- `TRADING_MODE` (`paper` or `real`, default `paper`; persisted in runtime config)
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`
 - `DEFAULT_SYMBOL`
@@ -107,7 +107,7 @@ Agent routes:
 
 - `POST /api/v1/agents/generate` generate an AI draft (ticker + strategy + defaults) without persisting
 - `GET /api/v1/agents/generate/stream` stream live research-thought events and final generated draft payload
-- `POST /api/v1/agents` create an agent (supports legacy payload or `{ generated: ... }` from `/generate`)
+- `POST /api/v1/agents` create and persist an agent from a generated draft (`{ generated: ... }` from `/generate`)
 - `GET /api/v1/agents` list agents
 - `GET /api/v1/agents/{agent_id}` fetch agent by ID across sessions
 - `POST /api/v1/agents/{agent_id}/activate` start agent
@@ -116,10 +116,8 @@ Agent routes:
 - `GET /api/v1/agents/{agent_id}/monitor` fetch detailed monitoring data (latest run + recent run details)
 - `GET /api/v1/agents/{agent_id}/monitor/stream` live SSE stream of run/status/trade events
 - `GET /api/v1/agents/positions` live Alpaca open positions for the active trading mode
-- `GET /api/v1/agents/summary?period=day|week|month|all` live Alpaca account overview (period is retained for compatibility)
+- `GET /api/v1/agents/summary?period=day|week|month|all` live Alpaca account overview
 - `GET /api/v1/agents/transactions?limit=200&mode=fills` live Alpaca fill activity (newest first)
-  - `mode=fills` is the canonical mode
-  - legacy `mode=executed|decisions` is accepted for compatibility, but returns fills
 
 ## Trading Mode Behavior
 
@@ -129,7 +127,7 @@ Agent routes:
 - The selected mode is persisted in `RUNTIME_CONFIG_PATH` and survives restarts.
 - `paper` mode uses `ALPACA_PAPER_*` credentials for all order executions.
 - `real` mode uses `ALPACA_REAL_*` credentials for all order executions.
-- Existing runs keep their historical records; only new executions use the updated mode.
+- Historical run records are preserved across mode changes; only new executions use the updated mode.
 
 ## Scheduler Behavior
 
@@ -146,7 +144,7 @@ Agent routes:
   - `execution_plan` entry/exit rules are applied when present
   - per-agent guardrails block sells without inventory and cap per-symbol exposure by risk profile
 - Agent status remains stable across scheduler re-runs: run completion updates run history/`last_run_at`, while active/paused state changes only through activate/pause actions or safety auto-pause paths.
-- On first-ever activation, agents now run a one-time bootstrap BUY attempt on the primary ticker (`ticker`, fallback first symbol):
+- On first-ever activation, agents run a one-time bootstrap BUY attempt on the primary ticker (`ticker`, fallback first symbol):
   - this seeds initial inventory so HOLD-first strategies are not stuck with zero holdings
   - bootstrap is attempted once per agent lifecycle and does not repeat on later pause/reactivate cycles
   - bootstrap trades are persisted in `runs` with `policy_action=activation_bootstrap_executed|activation_bootstrap_skipped` and `order_status` details
@@ -163,7 +161,7 @@ Agent routes:
   - portfolio drawdown threshold
 - Triggered follow-up refreshes update `signal_context`, `strategy`, `strategy_evaluation`, `execution_plan`, and `research_refs`.
 - Runtime follow-up research writes to `runtime` scope, and agent runs sync `research_refs` to the latest ticker-specific runtime record (fallback to generation scope when needed).
-- Monitor SSE now includes follow-up events:
+- Monitor SSE includes follow-up events:
   - `agent_followup_triggered`
   - `agent_strategy_refreshed`
   - `agent_strategy_refresh_failed`
@@ -171,35 +169,34 @@ Agent routes:
 
 ## New Agent UX
 
-- The `New` page no longer requires manual symbol/timeframe/interval/name input.
+- Strategy generation is fully automated; no manual symbol/timeframe/interval/name input is required.
 - Clicking **Generate Strategy** runs a two-agent pipeline:
   - **Research agent**: fetches active/tradable US equities from Alpaca, computes technical context, enforces strict quality floors (price, dollar volume, average volume, bounded volume ratio), keeps only top quality symbols, and drafts strategy output.
   - **Evaluator agent**: reviews the selected ticker + signal context + strategy draft and returns confidence, recommendation rationale, risk notes, and high-level execution bullets.
-- Research context now includes liquidity/value signals (for example `dollar_volume_estimate`, `liquidity_tier`, and `price_tier`) to bias generation toward higher-value/higher-volume names while still letting the LLM make the final call.
+- Research context includes liquidity/value signals (for example `dollar_volume_estimate`, `liquidity_tier`, and `price_tier`) to bias generation toward higher-value/higher-volume names while letting the LLM make the final call.
 - Quality-universe behavior is configurable:
   - scan up to `RESEARCH_CANDIDATE_SCAN_LIMIT` tradable symbols
   - apply hard quality filters
   - research only the top `RESEARCH_QUALITY_UNIVERSE_LIMIT` quality symbols (default `10`)
-- If strict filters produce zero qualified symbols, generation now returns a low-conviction fallback draft plus structured `quality_findings` (instead of hard failing the run).
+- If strict filters produce zero qualified symbols, generation returns a low-conviction fallback draft plus structured `quality_findings` rather than failing the run.
 - `quality_findings` include threshold values, pass/fail counts, and symbol-level filter checks to support findings table rendering in the `New` page.
 - Strategy picks are event-aware and may include catalyst fields such as `notable_events`, `event_time_horizon`, `event_risk`, and `liquidity_signal`.
 - Each generated draft stores markdown research snapshots under split scopes:
   - generation: `data/research/generation/YYYY-MM-DD/`
   - runtime refresh: `data/research/runtime/YYYY-MM-DD/`
-- Stored markdown metadata now includes compact event-focused hints (`event_focused`, `notable_event_count`, `highest_event_risk`, `recommendation`) for easier research record scanning.
+- Stored markdown metadata includes compact event-focused hints (`event_focused`, `notable_event_count`, `highest_event_risk`, `recommendation`) for easier research record scanning.
 - Strategy generation avoids repeating very recent symbol research when a fresh candidate exists.
 - Research retention is automatic: snapshots older than `RESEARCH_RETENTION_DAYS` are pruned during read/write operations.
 - Confidence policy is soft-gated:
   - `confidence >= 0.70` => `recommended`
-  - `confidence < 0.70` => `not_recommended` (agent creation is still allowed)
+  - `confidence < 0.70` => `not_recommended` (agent creation is allowed)
 - The UI shows ticker, timeframe, confidence/recommendation, rationale bullets, plan bullets, and risk notes.
 - The `New` page also includes a structured **Research Thought Process** pane sourced from `market_research_service` and `signal_service` outputs (`research_thoughts` in the generated draft payload).
 - While **Generate Strategy** is running, the New page streams research/signal thought updates live from `GET /api/v1/agents/generate/stream`, then auto-collapses the pane once the final strategy recommendation arrives (expandable on demand).
 - Clicking **Create Agent** sends the generated draft to `POST /api/v1/agents` and persists the agent.
 - Create requests enforce dedup checks against existing agents and recent research fingerprints; duplicate strategies return HTTP `409`.
-- New agents no longer include a per-agent run mode flag.
 - All broker order submissions use the global trading mode (`paper` or `real`).
-- Strategy decisions still include BUY/SELL/HOLD:
+- Strategy decisions include BUY/SELL/HOLD:
   - BUY/SELL decisions may submit broker orders.
   - HOLD or policy-blocked decisions are logged without order submission.
 
@@ -213,19 +210,19 @@ Agent routes:
   - latest run summary and per-symbol decision log entries (executed and non-executed)
   - recent run history
   - a live event feed powered by server-sent events (SSE)
-- Controls are intentionally simple in v1:
+- Controls:
   - **Activate/Pause**
 - **Delete** (stops active execution and permanently removes the strategy)
   - **Refresh**
 
 ## Overview UX
 
-- The `Overview` page merges the previous summary + positions views.
+- The `Overview` page presents account, positions, and transaction data in one place.
 - It displays:
   - live account KPIs (portfolio value, equity, cash, buying power, day-change, status/account number)
   - live open positions from Alpaca with unrealized P/L and percentages
   - live fill transaction history from Alpaca, newest first
-- Position symbols in the open positions table are now clickable strategy drill-ins:
+- Position symbols in the open positions table are clickable strategy drill-ins:
   - single agent match => opens `/agents/{agentId}` directly
   - multiple agent matches => shows an in-page picker to choose which agent strategy monitor to open
   - no agent match => shows an inline message explaining that no strategy is configured for that symbol
@@ -233,7 +230,7 @@ Agent routes:
   - backend Alpaca response cache: account/positions/fills are cached for a few seconds
   - frontend request cache: in-memory TTL + in-flight dedup for repeated reads
   - clicking **Refresh** bypasses frontend cache and fetches fresh backend data
-- Legacy `/positions` and `/summary` routes redirect to `/overview`.
+- `/positions` and `/summary` routes redirect to `/overview`.
 
 ## Research UX
 
@@ -247,7 +244,7 @@ Agent routes:
 
 ## Agent Runtime Fields
 
-`AgentResponse` now includes market-aware runtime metadata used by `New` and `Agents`:
+`AgentResponse` includes market-aware runtime metadata used by `New` and `Agents`:
 
 - `can_run_now`
 - `next_run_at`
