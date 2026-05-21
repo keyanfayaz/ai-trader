@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "live-frontend",
+      "runtimeExecutable": "true",
+      "runtimeArgs": [],
+      "port": 3100
+    },
+    {
+      "name": "live-proxy",
+      "runtimeExecutable": "true",
+      "runtimeArgs": [],
+      "port": 8080
+    }
+  ]
+}

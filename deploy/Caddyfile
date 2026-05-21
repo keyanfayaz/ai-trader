@@ -1,0 +1,28 @@
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	log {
+		output file /Users/orchestrategies/dev/ai-trader/deploy/logs/caddy.log
+	}
+
+	basic_auth {
+		{$AITRADER_USER} {$AITRADER_PASS_HASH}
+	}
+
+	# Backend API + health + SSE streams. flush_interval -1 disables
+	# response buffering so EventSource streams arrive in real time.
+	@backend path /api/* /health
+	handle @backend {
+		reverse_proxy 127.0.0.1:8000 {
+			flush_interval -1
+		}
+	}
+
+	# Everything else is the Next.js frontend.
+	handle {
+		reverse_proxy 127.0.0.1:3100
+	}
+}

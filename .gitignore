@@ -1,2 +1,6 @@
 data/
 .venv/
+deploy/secrets.env
+deploy/logs/
+deploy/CURRENT_URL.txt
+backend/.env
