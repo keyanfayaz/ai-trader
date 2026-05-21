@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -39,6 +39,7 @@ class StrategyResearchRequest(BaseModel):
     symbols: list[str] = Field(min_length=1)
     timeframe: str | None = None
     risk_profile: str = "balanced"
+    skill_ids: list[str] | None = None
 
 
 class StrategyResearchResponse(BaseModel):
@@ -168,6 +169,7 @@ class GeneratedAgentDraft(BaseModel):
     symbols: list[str] = Field(min_length=1)
     ticker: str
     timeframe: str
+    asset_class: Literal["stock", "future"] = "stock"
     risk_profile: str
     interval_seconds: int = Field(ge=5)
     signal_context: list[dict[str, Any]]
@@ -177,15 +179,18 @@ class GeneratedAgentDraft(BaseModel):
     research_refs: list[ResearchReference]
     research_thoughts: list[dict[str, Any]] = Field(default_factory=list)
     quality_findings: QualityFindings | None = None
+    skill_ids: list[str] = Field(default_factory=list)
 
 
 class AgentCreateRequest(BaseModel):
     symbols: list[str] | None = None
     timeframe: str | None = None
+    asset_class: Literal["stock", "future"] = "stock"
     risk_profile: str | None = None
     interval_seconds: int | None = Field(default=None, ge=5)
     name: str | None = None
     generated: GeneratedAgentDraft | None = None
+    skill_ids: list[str] | None = None
 
 
 class AgentGenerateResponse(BaseModel):
@@ -231,6 +236,7 @@ class AgentResponse(BaseModel):
     symbols: list[str]
     ticker: str
     timeframe: str
+    asset_class: Literal["stock", "future"] = "stock"
     risk_profile: str
     interval_seconds: int
     signal_context: list[dict[str, Any]]
@@ -249,6 +255,20 @@ class AgentResponse(BaseModel):
     next_market_open: str | None
     next_market_close: str | None
     market_status_label: str
+    skill_ids: list[str] = Field(default_factory=list)
+    mission_status: str | None = None
+    input_kind: str | None = None
+    input_theme: str | None = None
+    theme_summary: str = ""
+    basket: list[dict[str, Any]] = Field(default_factory=list)
+    strategy_window_seconds: int | None = None
+    window_rationale: str = ""
+    window_started_at: str | None = None
+    window_ends_at: str | None = None
+    approved_at: str | None = None
+    terminal_reason: str | None = None
+    generated_skill_id: str | None = None
+    decision_log: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentListResponse(BaseModel):
@@ -328,3 +348,97 @@ class TradingModeResponse(BaseModel):
 
 class TradingModeUpdateRequest(BaseModel):
     trading_mode: str = Field(pattern="^(paper|real)$")
+
+
+class ProviderCapabilityResponse(BaseModel):
+    id: str
+    label: str
+    market_data: bool
+    trading: bool
+    asset_classes: list[str]
+    supports_paper: bool
+    description: str = ""
+
+
+class ProviderSelectionResponse(BaseModel):
+    data_provider: str
+    broker_provider: str
+    providers: list[ProviderCapabilityResponse]
+
+
+class ProviderSelectionUpdateRequest(BaseModel):
+    data_provider: str | None = None
+    broker_provider: str | None = None
+
+
+class SkillSummary(BaseModel):
+    id: str
+    name: str
+    slug: str
+    description: str
+    source: str
+    created_at: str
+    updated_at: str
+    version: str
+    file_count: int
+    total_bytes: int
+
+
+class SkillListResponse(BaseModel):
+    skills: list[SkillSummary] = Field(default_factory=list)
+
+
+class SkillFileItem(BaseModel):
+    path: str
+    bytes: int
+
+
+class SkillDetailResponse(SkillSummary):
+    markdown: str
+    files: list[SkillFileItem] = Field(default_factory=list)
+
+
+class SkillFileResponse(BaseModel):
+    path: str
+    content: str
+
+
+class SkillEditorCreateRequest(BaseModel):
+    name: str | None = None
+    markdown: str = Field(min_length=1)
+
+
+class SkillUpdateRequest(BaseModel):
+    markdown: str = Field(min_length=1)
+    expected_version: str | None = None
+
+
+class SkillDeleteResponse(BaseModel):
+    skill_id: str
+    deleted: bool = True
+
+
+class AgentSkillsUpdateRequest(BaseModel):
+    skill_ids: list[str] = Field(default_factory=list)
+
+
+class MissionGenerateRequest(BaseModel):
+    symbols: list[str] | None = None
+    theme: str | None = None
+    timeframe: str | None = None
+    asset_class: Literal["stock", "future"] = "stock"
+    risk_profile: str | None = None
+    skill_ids: list[str] | None = None
+
+
+class MissionGenerateResponse(BaseModel):
+    draft: dict[str, Any]
+
+
+class MissionCreateRequest(BaseModel):
+    draft: dict[str, Any]
+    skill_ids: list[str] | None = None
+
+
+class MissionApproveRequest(BaseModel):
+    window_seconds: int | None = Field(default=None, ge=60)

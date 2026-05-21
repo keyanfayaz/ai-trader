@@ -1,4 +1,6 @@
 {
   "version": 1,
-  "trading_mode": "real"
+  "trading_mode": "real",
+  "data_provider": "alpaca",
+  "broker_provider": "alpaca"
 }

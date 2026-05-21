@@ -9,7 +9,12 @@ from typing import Any, AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.api.dependencies import get_agent_management_service, get_agent_monitor_stream
+from app.api.dependencies import (
+    get_agent_management_service,
+    get_agent_monitor_stream,
+    get_provider_selection,
+)
+from app.clients.providers.base import PROVIDER_REGISTRY
 from app.api.schemas import (
     AgentCreateRequest,
     AgentDeleteResponse,
@@ -20,6 +25,11 @@ from app.api.schemas import (
     AgentRunDetail,
     AgentRunTrade,
     AgentRunSummary,
+    AgentSkillsUpdateRequest,
+    MissionApproveRequest,
+    MissionCreateRequest,
+    MissionGenerateRequest,
+    MissionGenerateResponse,
     PositionsResponse,
     SummaryResponse,
     TransactionItem,
@@ -33,11 +43,39 @@ from app.services.agent_monitor_stream import AgentMonitorStream
 router = APIRouter()
 
 
+def _validate_asset_class_against_providers(asset_class: str) -> None:
+    """Reject agent creation when the selected providers can't serve the asset class."""
+    selection = get_provider_selection()
+    data_caps = PROVIDER_REGISTRY.get(selection["data_provider"])
+    broker_caps = PROVIDER_REGISTRY.get(selection["broker_provider"])
+    if data_caps is None or not data_caps.supports_asset_class(asset_class):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Data provider '{selection['data_provider']}' does not support "
+                f"'{asset_class}'. Choose a {asset_class}-capable data provider in Settings."
+            ),
+        )
+    if broker_caps is not None and not broker_caps.supports_asset_class(asset_class):
+        # Futures with the stock broker (Alpaca) degrades to view-only/no-order.
+        # A futures-only broker (TopStepX) on a stock agent is nonsensical -> 400.
+        degradable = asset_class == "future" and selection["broker_provider"] == "alpaca"
+        if not degradable:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Broker '{selection['broker_provider']}' does not support "
+                    f"'{asset_class}'. Select a {asset_class}-capable broker in Settings."
+                ),
+            )
+
+
 @router.post("", response_model=AgentResponse)
 def create_agent(
     payload: AgentCreateRequest,
     agent_service: AgentManagementService = Depends(get_agent_management_service),
 ) -> AgentResponse:
+    _validate_asset_class_against_providers(payload.asset_class)
     try:
         record = agent_service.create_agent(
             symbols=payload.symbols,
@@ -46,6 +84,8 @@ def create_agent(
             interval_seconds=payload.interval_seconds,
             name=payload.name,
             generated=payload.generated.model_dump() if payload.generated else None,
+            skill_ids=payload.skill_ids,
+            asset_class=payload.asset_class,
         )
         return _to_agent_response(record, runtime=_runtime_for(agent_service, record))
     except DuplicateStrategyError as exc:
@@ -56,17 +96,23 @@ def create_agent(
 
 @router.post("/generate", response_model=AgentGenerateResponse)
 def generate_agent(
+    asset_class: str = Query(default="stock"),
     agent_service: AgentManagementService = Depends(get_agent_management_service),
 ) -> AgentGenerateResponse:
-    generated = agent_service.generate_agent_draft()
+    resolved = asset_class if asset_class in ("stock", "future") else "stock"
+    _validate_asset_class_against_providers(resolved)
+    generated = agent_service.generate_agent_draft(asset_class=resolved)
     return AgentGenerateResponse(generated=generated)
 
 
 @router.get("/generate/stream")
 async def generate_agent_stream(
     request: Request,
+    asset_class: str = Query(default="stock"),
     agent_service: AgentManagementService = Depends(get_agent_management_service),
 ) -> StreamingResponse:
+    resolved_asset_class = asset_class if asset_class in ("stock", "future") else "stock"
+    _validate_asset_class_against_providers(resolved_asset_class)
     queue: Queue[dict[str, Any]] = Queue(maxsize=400)
 
     def progress_callback(item: dict[str, Any]) -> None:
@@ -79,7 +125,10 @@ async def generate_agent_stream(
 
     def run_generation() -> None:
         try:
-            generated = agent_service.generate_agent_draft(progress_callback=progress_callback)
+            generated = agent_service.generate_agent_draft(
+                progress_callback=progress_callback,
+                asset_class=resolved_asset_class,
+            )
             queue.put({"event": "generate_completed", "payload": {"generated": generated}})
         except Exception as exc:  # pragma: no cover - stream failure path
             queue.put({"event": "generate_failed", "payload": {"error": str(exc)}})
@@ -113,6 +162,129 @@ async def generate_agent_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/mission/generate", response_model=MissionGenerateResponse)
+def generate_mission(
+    payload: MissionGenerateRequest,
+    agent_service: AgentManagementService = Depends(get_agent_management_service),
+) -> MissionGenerateResponse:
+    _validate_asset_class_against_providers(payload.asset_class)
+    draft = agent_service.generate_mission_draft(
+        symbols=payload.symbols,
+        theme=payload.theme,
+        timeframe=payload.timeframe,
+        risk_profile=payload.risk_profile,
+        skill_ids=payload.skill_ids,
+        asset_class=payload.asset_class,
+    )
+    return MissionGenerateResponse(draft=draft)
+
+
+@router.get("/mission/generate/stream")
+async def generate_mission_stream(
+    request: Request,
+    theme: str | None = Query(default=None),
+    symbols: str | None = Query(default=None),
+    risk_profile: str | None = Query(default=None),
+    timeframe: str | None = Query(default=None),
+    asset_class: str = Query(default="stock"),
+    skill_ids: str | None = Query(default=None),
+    agent_service: AgentManagementService = Depends(get_agent_management_service),
+) -> StreamingResponse:
+    resolved_asset_class = asset_class if asset_class in ("stock", "future") else "stock"
+    _validate_asset_class_against_providers(resolved_asset_class)
+    symbol_list = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()] or None
+    skill_list = [s.strip() for s in (skill_ids or "").split(",") if s.strip()] or None
+    queue: Queue[dict[str, Any]] = Queue(maxsize=400)
+
+    def progress_callback(item: dict[str, Any]) -> None:
+        queue.put({"event": "research_thought", "payload": item})
+
+    def run_generation() -> None:
+        try:
+            draft = agent_service.generate_mission_draft(
+                symbols=symbol_list,
+                theme=theme,
+                timeframe=timeframe,
+                risk_profile=risk_profile,
+                skill_ids=skill_list,
+                progress_callback=progress_callback,
+                asset_class=resolved_asset_class,
+            )
+            queue.put({"event": "generate_completed", "payload": {"draft": draft}})
+        except Exception as exc:  # pragma: no cover - stream failure path
+            queue.put({"event": "generate_failed", "payload": {"error": str(exc)}})
+
+    thread = Thread(target=run_generation, daemon=True, name="mission-generate-stream")
+    thread.start()
+
+    async def event_generator() -> AsyncIterator[str]:
+        terminal_event_sent = False
+        while True:
+            if await request.is_disconnected():
+                break
+            if terminal_event_sent:
+                await asyncio.sleep(0.2)
+                continue
+            try:
+                event_payload = await asyncio.to_thread(queue.get, True, 1.0)
+            except Empty:
+                yield ": keepalive\n\n"
+                continue
+            yield _to_sse_frame(event_payload)
+            if event_payload.get("event") in {"generate_completed", "generate_failed"}:
+                terminal_event_sent = True
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/mission", response_model=AgentResponse)
+def create_mission(
+    payload: MissionCreateRequest,
+    agent_service: AgentManagementService = Depends(get_agent_management_service),
+) -> AgentResponse:
+    draft_asset_class = str(payload.draft.get("asset_class") or "stock")
+    _validate_asset_class_against_providers(draft_asset_class)
+    record = agent_service.create_mission_agent(
+        draft=payload.draft, skill_ids=payload.skill_ids
+    )
+    return _to_agent_response(record, runtime=_runtime_for(agent_service, record))
+
+
+@router.post("/{agent_id}/approve", response_model=AgentResponse)
+def approve_mission(
+    agent_id: str,
+    payload: MissionApproveRequest,
+    agent_service: AgentManagementService = Depends(get_agent_management_service),
+) -> AgentResponse:
+    try:
+        record = agent_service.approve_mission(agent_id, window_seconds_override=payload.window_seconds)
+        return _to_agent_response(record, runtime=_runtime_for(agent_service, record))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidGeneratedDraftError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{agent_id}/reject", response_model=AgentResponse)
+def reject_mission(
+    agent_id: str,
+    agent_service: AgentManagementService = Depends(get_agent_management_service),
+) -> AgentResponse:
+    try:
+        record = agent_service.reject_mission(agent_id)
+        return _to_agent_response(record, runtime=_runtime_for(agent_service, record))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("", response_model=AgentListResponse)
@@ -249,6 +421,19 @@ def pause_agent(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.put("/{agent_id}/skills", response_model=AgentResponse)
+def set_agent_skills(
+    agent_id: str,
+    payload: AgentSkillsUpdateRequest,
+    agent_service: AgentManagementService = Depends(get_agent_management_service),
+) -> AgentResponse:
+    try:
+        record = agent_service.set_agent_skills(agent_id, payload.skill_ids)
+        return _to_agent_response(record, runtime=_runtime_for(agent_service, record))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.delete("/{agent_id}", response_model=AgentDeleteResponse)
 def delete_agent(
     agent_id: str,
@@ -291,6 +476,7 @@ def _to_agent_response(record: dict, runtime: dict[str, Any]) -> AgentResponse:
         symbols=record.get("symbols", []),
         ticker=record.get("ticker", (record.get("symbols", [""])[0] if record.get("symbols") else "")),
         timeframe=record.get("timeframe", ""),
+        asset_class=record.get("asset_class", "stock") or "stock",
         risk_profile=record.get("risk_profile", "balanced"),
         interval_seconds=int(record.get("interval_seconds", 60)),
         signal_context=record.get("signal_context", []),
@@ -320,6 +506,24 @@ def _to_agent_response(record: dict, runtime: dict[str, Any]) -> AgentResponse:
         next_market_open=runtime.get("next_market_open"),
         next_market_close=runtime.get("next_market_close"),
         market_status_label=str(runtime.get("market_status_label", "unknown")),
+        skill_ids=[str(item) for item in record.get("skill_ids", []) if str(item).strip()],
+        mission_status=record.get("mission_status"),
+        input_kind=record.get("input_kind"),
+        input_theme=record.get("input_theme"),
+        theme_summary=str(record.get("theme_summary", "")),
+        basket=record.get("basket", []) or [],
+        strategy_window_seconds=(
+            int(record["strategy_window_seconds"])
+            if record.get("strategy_window_seconds") is not None
+            else None
+        ),
+        window_rationale=str(record.get("window_rationale", "")),
+        window_started_at=record.get("window_started_at"),
+        window_ends_at=record.get("window_ends_at"),
+        approved_at=record.get("approved_at"),
+        terminal_reason=record.get("terminal_reason"),
+        generated_skill_id=record.get("generated_skill_id"),
+        decision_log=record.get("decision_log", []) or [],
     )
 
 

@@ -253,11 +253,22 @@ export default function AgentsPage() {
             {agents.map((agent) => (
               <tr key={agent.agent_id}>
                 <td>{agent.name}</td>
-                <td>{agent.symbols.join(", ")}</td>
+                <td>
+                  {agent.symbols.join(", ")}
+                  {agent.asset_class === "future" ? (
+                    <span className="tag" style={{ marginLeft: 6 }}>
+                      Futures
+                    </span>
+                  ) : null}
+                </td>
                 <td>{agent.risk_profile}</td>
                 <td>Global trading mode (paper/live)</td>
-                <td>{agent.status}</td>
-                <td>{getRuntimeLabel(agent)}</td>
+                <td>{agent.mission_status ? `${agent.status} · ${agent.mission_status}` : agent.status}</td>
+                <td>
+                  {agent.mission_status === "executing" && agent.window_ends_at
+                    ? `Window ends ${toLocalTimestamp(agent.window_ends_at)}`
+                    : getRuntimeLabel(agent)}
+                </td>
                 <td>{agent.last_run_at ? toLocalTimestamp(agent.last_run_at) : "Never"}</td>
                 <td>
                   <div className="row-actions">

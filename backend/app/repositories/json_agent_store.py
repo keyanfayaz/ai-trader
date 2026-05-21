@@ -13,15 +13,23 @@ class JsonAgentStore:
         self.file_path = Path(file_path)
         self._lock = Lock()
 
+    @staticmethod
+    def _with_defaults(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        # Back-compat: agents created before multi-asset support default to stock.
+        record.setdefault("asset_class", "stock")
+        return record
+
     def list_agents(self) -> list[dict[str, Any]]:
         payload = self._read_payload()
         agents = payload.get("agents", {})
-        return [record for record in agents.values()]
+        return [self._with_defaults(record) for record in agents.values()]
 
     def get_agent(self, agent_id: str) -> dict[str, Any] | None:
         payload = self._read_payload()
         agents = payload.get("agents", {})
-        return agents.get(agent_id)
+        return self._with_defaults(agents.get(agent_id))
 
     def save_agent(self, agent_record: dict[str, Any]) -> dict[str, Any]:
         agent_id = str(agent_record.get("agent_id", "")).strip()

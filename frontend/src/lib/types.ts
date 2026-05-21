@@ -27,6 +27,8 @@ export type AgentRunDetail = {
   trades: AgentRunTrade[];
 };
 
+export type AssetClass = "stock" | "future";
+
 export type Agent = {
   agent_id: string;
   name: string;
@@ -37,6 +39,7 @@ export type Agent = {
   symbols: string[];
   ticker: string;
   timeframe: string;
+  asset_class: AssetClass;
   risk_profile: string;
   interval_seconds: number;
   signal_context: Array<Record<string, unknown>>;
@@ -55,6 +58,86 @@ export type Agent = {
   next_market_open: string | null;
   next_market_close: string | null;
   market_status_label: string;
+  skill_ids: string[];
+  mission_status?: MissionStatus | null;
+  input_kind?: string | null;
+  input_theme?: string | null;
+  theme_summary?: string;
+  basket?: BasketPick[];
+  strategy_window_seconds?: number | null;
+  window_rationale?: string;
+  window_started_at?: string | null;
+  window_ends_at?: string | null;
+  approved_at?: string | null;
+  terminal_reason?: string | null;
+  generated_skill_id?: string | null;
+  decision_log?: DecisionLogEntry[];
+};
+
+export type MissionStatus =
+  | "awaiting_approval"
+  | "armed"
+  | "executing"
+  | "completed"
+  | "rejected";
+
+export type BasketPick = {
+  symbol: string;
+  rationale: string;
+  score: number;
+};
+
+export type ExecutionPlanLeg = {
+  symbol: string;
+  entry: { type: string; ref_price: number | null; condition: string };
+  target_pct: number;
+  stop_pct: number;
+  weight: number;
+};
+
+export type MissionExecutionPlan = {
+  recommended_window_seconds: number;
+  window_rationale: string;
+  plan_notes: string;
+  legs: ExecutionPlanLeg[];
+};
+
+export type DecisionLogEntry = {
+  at: string;
+  phase: string;
+  symbol: string;
+  action: string;
+  reason: string;
+  order_id?: string | null;
+  filled_qty?: number | null;
+  filled_avg_price?: number | null;
+};
+
+export type MissionDraft = {
+  name: string;
+  symbols: string[];
+  ticker: string;
+  timeframe: string;
+  asset_class?: AssetClass;
+  risk_profile: string;
+  input_kind: string;
+  input_theme: string | null;
+  theme_summary: string;
+  basket: BasketPick[];
+  signal_context: Array<Record<string, unknown>>;
+  strategy: Record<string, unknown>;
+  strategy_evaluation: StrategyEvaluation;
+  execution_plan: MissionExecutionPlan;
+  window_seconds: number;
+  window_rationale: string;
+  skill_markdown: string;
+  research_refs: ResearchReference[];
+  research_thoughts?: Array<Record<string, unknown>>;
+  preset_skill_ids?: string[];
+};
+
+export type MissionGenerateResponse = {
+  draft: MissionDraft;
 };
 
 export type AgentListResponse = {
@@ -154,6 +237,7 @@ export type CreateAgentPayload = {
   interval_seconds?: number;
   name?: string;
   generated?: GeneratedAgentDraft;
+  skill_ids?: string[];
 };
 
 export type GeneratedAgentDraft = {
@@ -170,6 +254,7 @@ export type GeneratedAgentDraft = {
   research_refs: ResearchReference[];
   research_thoughts?: Array<Record<string, unknown>>;
   quality_findings?: QualityFindings | null;
+  skill_ids?: string[];
 };
 
 export type AgentGenerateResponse = {
@@ -275,8 +360,51 @@ export type QualityFindings = {
   rows: QualityFindingRow[];
 };
 
+export type SkillSummary = {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+  source: "upload" | "editor" | string;
+  created_at: string;
+  updated_at: string;
+  version: string;
+  file_count: number;
+  total_bytes: number;
+};
+
+export type SkillFileItem = {
+  path: string;
+  bytes: number;
+};
+
+export type SkillDetail = SkillSummary & {
+  markdown: string;
+  files: SkillFileItem[];
+};
+
+export type SkillListResponse = {
+  skills: SkillSummary[];
+};
+
 export type TradingMode = "paper" | "real";
 
 export type TradingModeResponse = {
   trading_mode: TradingMode;
+};
+
+export type ProviderCapability = {
+  id: string;
+  label: string;
+  market_data: boolean;
+  trading: boolean;
+  asset_classes: string[];
+  supports_paper: boolean;
+  description: string;
+};
+
+export type ProviderSelection = {
+  data_provider: string;
+  broker_provider: string;
+  providers: ProviderCapability[];
 };

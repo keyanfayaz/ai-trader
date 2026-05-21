@@ -20,12 +20,14 @@ from app.api.dependencies import (
     get_research_store,
     get_runtime_config_store,
     get_settings,
+    get_skill_store,
     get_trading_service,
 )
 from app.clients.alpaca_client import AlpacaClient
 from app.clients.openai_client import build_openai_client
 from app.repositories.json_agent_store import JsonAgentStore
 from app.repositories.markdown_research_store import MarkdownResearchStore, ResearchRecord
+from app.repositories.skill_store import SkillStore
 from app.services.agent_management_service import AgentManagementService, DuplicateStrategyError
 from app.services.market_research_service import MarketResearchService
 from app.services.trading_service import TradingService
@@ -275,7 +277,24 @@ class FakeTradingService:
 
     settings = _Settings()
 
-    def buy(self, symbol: str, qty: float | None, order_type: str, time_in_force: str) -> dict[str, Any]:
+    def __init__(self) -> None:
+        self.open_positions: list[dict[str, Any]] = []
+        self.market_open: bool = True
+        self.latest_close: float = 100.0
+        self.signal_orders: list[dict[str, Any]] = []
+
+    def get_open_positions(self) -> list[dict[str, Any]]:
+        return list(self.open_positions)
+
+    def get_market_runtime(self) -> dict[str, Any]:
+        return {
+            "is_market_open": self.market_open,
+            "next_market_open": None,
+            "next_market_close": None,
+            "market_status_label": "open" if self.market_open else "closed",
+        }
+
+    def buy(self, symbol: str, qty: float | None, order_type: str, time_in_force: str, asset_class: str = "stock") -> dict[str, Any]:
         return {
             "symbol": symbol.upper(),
             "qty": qty or 1.0,
@@ -285,7 +304,7 @@ class FakeTradingService:
             "status": "accepted",
         }
 
-    def sell(self, symbol: str, qty: float | None, order_type: str, time_in_force: str) -> dict[str, Any]:
+    def sell(self, symbol: str, qty: float | None, order_type: str, time_in_force: str, asset_class: str = "stock") -> dict[str, Any]:
         return {
             "symbol": symbol.upper(),
             "qty": qty or 1.0,
@@ -300,12 +319,16 @@ class FakeTradingService:
         symbol: str | None,
         timeframe: str | None,
         limit: int | None = None,
+        asset_class: str = "stock",
     ) -> list[dict[str, float | int]]:
         _ = symbol
         _ = timeframe
+        _ = asset_class
         bars = []
-        for idx in range(limit or 25):
-            bars.append({"t": idx, "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5 + idx, "v": 10 + idx})
+        count = limit or 25
+        for idx in range(count):
+            close = 1.5 + idx if idx < count - 1 else float(self.latest_close)
+            bars.append({"t": idx, "o": 1.0, "h": 2.0, "l": 0.5, "c": close, "v": 10 + idx})
         return bars
 
     def calculate_signal(self, bars: list[dict[str, Any]]) -> FakeSignal:
@@ -317,17 +340,24 @@ class FakeTradingService:
         symbol: str,
         signal: str,
         qty: float | None = None,
+        asset_class: str = "stock",
     ) -> dict[str, Any] | None:
+        _ = asset_class
         normalized_signal = signal.upper()
         if normalized_signal not in {"BUY", "SELL"}:
             return None
         side = "buy" if normalized_signal == "BUY" else "sell"
-        return {
+        order = {
+            "id": f"ord-{len(self.signal_orders) + 1}",
             "symbol": symbol.upper(),
             "qty": qty or 1.0,
             "side": side,
-            "status": "accepted",
+            "status": "filled",
+            "filled_qty": qty or 1.0,
+            "filled_avg_price": float(self.latest_close),
         }
+        self.signal_orders.append(order)
+        return order
 
     def run(self, symbol: str, timeframe: str, use_openai_explanation: bool) -> FakeRunResult:
         _ = timeframe
@@ -386,7 +416,13 @@ class FakeResearchService:
         timeframe: str | None,
         risk_profile: str,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        skill_ids: list[str] | None = None,
+        research_scope: str = "generation",
+        asset_class: str = "stock",
     ) -> FakeResearchResult:
+        _ = skill_ids
+        _ = research_scope
+        _ = asset_class
         if progress_callback is not None:
             progress_callback(
                 {
@@ -405,8 +441,12 @@ class FakeResearchService:
         risk_profile: str = "balanced",
         max_candidates: int = 120,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        skill_ids: list[str] | None = None,
+        asset_class: str = "stock",
     ) -> FakeResearchResult:
         _ = max_candidates
+        _ = skill_ids
+        _ = asset_class
         if progress_callback is not None:
             progress_callback(
                 {
@@ -418,6 +458,77 @@ class FakeResearchService:
         result = FakeResearchResult(symbols=["AAPL"], timeframe=timeframe or "1Day", risk_profile=risk_profile)
         self.research_store.records = [*self.research_store.records, *result.research_refs]
         return result
+
+    def build_mission(
+        self,
+        symbols: list[str] | None = None,
+        theme: str | None = None,
+        timeframe: str | None = None,
+        risk_profile: str = "balanced",
+        skill_ids: list[str] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        asset_class: str = "stock",
+    ) -> "MissionResearchResult":
+        _ = asset_class
+        from app.services.market_research_service import MissionResearchResult
+
+        if progress_callback is not None:
+            progress_callback(
+                {"stage": "theme_expansion", "message": "Expanding theme.", "source": "agent"}
+            )
+        resolved = [s.upper() for s in (symbols or ["AAPL"])]
+        return MissionResearchResult(
+            symbols=resolved,
+            ticker=resolved[0],
+            timeframe=timeframe or "1Day",
+            risk_profile=risk_profile,
+            input_kind="theme" if theme else "ticker",
+            input_theme=theme,
+            theme_summary="A focused basket." if theme else "",
+            basket=[{"symbol": s, "rationale": "fake", "score": 0.8} for s in resolved],
+            signal_context=[{"symbol": resolved[0], "signal": "BUY"}],
+            strategy={"picks": [{"symbol": resolved[0], "suggested_action": "buy"}]},
+            evaluation={
+                "confidence": 0.8,
+                "threshold": 0.7,
+                "recommendation": "recommended",
+                "decision_summary": "Strong setup.",
+                "key_reasons": ["momentum"],
+                "risk_notes": [],
+                "high_level_plan": ["enter", "exit by window"],
+            },
+            execution_plan={
+                "recommended_window_seconds": 1800,
+                "window_rationale": "Intraday momentum.",
+                "plan_notes": "",
+                "legs": [
+                    {
+                        "symbol": resolved[0],
+                        "entry": {"type": "market", "ref_price": None, "condition": "immediate"},
+                        "target_pct": 2.0,
+                        "stop_pct": 1.0,
+                        "weight": 1.0,
+                    }
+                ],
+            },
+            window_seconds=1800,
+            window_rationale="Intraday momentum.",
+            skill_markdown=(
+                "---\nname: fake-mission-skill\n"
+                "description: Fake strategy skill for tests.\n---\n\n# Fake\n"
+            ),
+            research_refs=[
+                {
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "file_path": f"/tmp/{resolved[0]}.md",
+                    "strategy_fingerprint": "fp-mission",
+                    "ticker": resolved[0],
+                    "timeframe": timeframe or "1Day",
+                    "symbols": resolved,
+                }
+            ],
+            research_thoughts=[{"stage": "mission", "message": "done", "source": "svc"}],
+        )
 
 
 class FakeAgentService:
@@ -468,9 +579,13 @@ class FakeAgentService:
         interval_seconds: int | None,
         name: str | None,
         generated: dict[str, Any] | None = None,
+        skill_ids: list[str] | None = None,
+        asset_class: str = "stock",
     ) -> dict[str, Any]:
         _ = timeframe
         _ = interval_seconds
+        self._agent["asset_class"] = asset_class
+        self._agent["skill_ids"] = list(skill_ids or [])
         if generated:
             if str(generated.get("name", "")).lower().startswith("duplicate"):
                 raise DuplicateStrategyError("Similar strategy already exists")
@@ -500,12 +615,16 @@ class FakeAgentService:
         interval_seconds: int | None = None,
         name: str | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        skill_ids: list[str] | None = None,
+        asset_class: str = "stock",
     ) -> dict[str, Any]:
         _ = symbols
         _ = timeframe
         _ = risk_profile
+        _ = asset_class
         _ = interval_seconds
         _ = name
+        _ = skill_ids
         if progress_callback is not None:
             progress_callback(
                 {
@@ -559,6 +678,92 @@ class FakeAgentService:
             ],
         }
 
+    def generate_mission_draft(
+        self,
+        symbols: list[str] | None = None,
+        theme: str | None = None,
+        timeframe: str | None = None,
+        risk_profile: str | None = None,
+        skill_ids: list[str] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        asset_class: str = "stock",
+    ) -> dict[str, Any]:
+        _ = (timeframe, skill_ids, asset_class)
+        if progress_callback is not None:
+            progress_callback({"stage": "theme_expansion", "message": "x", "source": "agent"})
+        return {
+            "name": f"{theme or (symbols or ['AAPL'])[0]} mission",
+            "symbols": [s.upper() for s in (symbols or ["AAPL"])],
+            "ticker": (symbols or ["AAPL"])[0].upper(),
+            "timeframe": "1Day",
+            "risk_profile": risk_profile or "balanced",
+            "input_kind": "theme" if theme else "ticker",
+            "input_theme": theme,
+            "theme_summary": "summary",
+            "basket": [{"symbol": "AAPL", "rationale": "r", "score": 0.9}],
+            "signal_context": [{"symbol": "AAPL", "signal": "BUY"}],
+            "strategy": {"picks": []},
+            "strategy_evaluation": {
+                "confidence": 0.8,
+                "threshold": 0.7,
+                "recommendation": "recommended",
+                "decision_summary": "ok",
+                "key_reasons": ["a"],
+                "risk_notes": [],
+                "high_level_plan": ["b"],
+            },
+            "execution_plan": {
+                "recommended_window_seconds": 1800,
+                "window_rationale": "intraday",
+                "plan_notes": "",
+                "legs": [
+                    {
+                        "symbol": "AAPL",
+                        "entry": {"type": "market", "ref_price": None, "condition": "now"},
+                        "target_pct": 2.0,
+                        "stop_pct": 1.0,
+                        "weight": 1.0,
+                    }
+                ],
+            },
+            "window_seconds": 1800,
+            "window_rationale": "intraday",
+            "skill_markdown": "---\nname: m\ndescription: d\n---\n# m\n",
+            "research_refs": [],
+            "research_thoughts": [],
+            "preset_skill_ids": [],
+        }
+
+    def create_mission_agent(
+        self, draft: dict[str, Any], skill_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        _ = skill_ids
+        self._agent["mission_status"] = "awaiting_approval"
+        self._agent["status"] = "paused"
+        self._agent["strategy_window_seconds"] = int(draft.get("window_seconds", 1800))
+        self._agent["execution_plan"] = draft.get("execution_plan", {})
+        self._agent["decision_log"] = []
+        self._agent["generated_skill_id"] = "skill-xyz"
+        return self._agent
+
+    def approve_mission(
+        self, agent_id: str, window_seconds_override: int | None = None
+    ) -> dict[str, Any]:
+        if agent_id != self._agent["agent_id"]:
+            raise KeyError(agent_id)
+        self._agent["mission_status"] = "armed"
+        self._agent["status"] = "active"
+        if window_seconds_override is not None:
+            self._agent["strategy_window_seconds"] = int(window_seconds_override)
+        return self._agent
+
+    def reject_mission(self, agent_id: str) -> dict[str, Any]:
+        if agent_id != self._agent["agent_id"]:
+            raise KeyError(agent_id)
+        self._agent["mission_status"] = "rejected"
+        self._agent["status"] = "paused"
+        return self._agent
+
     def list_agents(self) -> list[dict[str, Any]]:
         if self._deleted:
             return []
@@ -579,6 +784,12 @@ class FakeAgentService:
     def pause_agent(self, agent_id: str) -> dict[str, Any]:
         _ = agent_id
         self._agent["status"] = "paused"
+        return self._agent
+
+    def set_agent_skills(self, agent_id: str, skill_ids: list[str] | None) -> dict[str, Any]:
+        if self._deleted or agent_id != self._agent["agent_id"]:
+            raise KeyError(agent_id)
+        self._agent["skill_ids"] = list(skill_ids or [])
         return self._agent
 
     def delete_agent(self, agent_id: str) -> dict[str, Any]:
@@ -662,6 +873,12 @@ def settings_factory() -> Callable[..., Settings]:
             alpaca_real_secret_key="test-real-secret",
             alpaca_real_base_url="https://api.alpaca.markets",
             trading_mode="paper",
+            databento_api_key="",
+            massive_api_key="",
+            topstepx_api_key="",
+            topstepx_username="",
+            data_provider="alpaca",
+            broker_provider="alpaca",
             openai_api_key="test-openai",
             openai_model="gpt-test",
             default_symbol="AAPL",
@@ -741,6 +958,7 @@ def api_client(
     fake_research_service: FakeResearchService,
     fake_agent_service: FakeAgentService,
     fake_research_store: FakeResearchStore,
+    tmp_path: Path,
 ) -> Iterator[TestClient]:
     os.environ.setdefault("ALPACA_PAPER_API_KEY", "test-paper-key")
     os.environ.setdefault("ALPACA_PAPER_SECRET_KEY", "test-paper-secret")
@@ -758,6 +976,8 @@ def api_client(
     app.dependency_overrides[get_market_research_service] = lambda: fake_research_service
     app.dependency_overrides[get_agent_management_service] = lambda: fake_agent_service
     app.dependency_overrides[get_research_store] = lambda: fake_research_store
+    skill_store = SkillStore(base_dir=str(tmp_path / "skills"))
+    app.dependency_overrides[get_skill_store] = lambda: skill_store
     with TestClient(app) as client:
         yield client
 
@@ -791,6 +1011,12 @@ def integration_settings(tmp_path: Path) -> Settings:
         alpaca_real_secret_key=loaded.alpaca_real_secret_key,
         alpaca_real_base_url=loaded.alpaca_real_base_url,
         trading_mode=loaded.trading_mode,
+        databento_api_key=loaded.databento_api_key,
+        massive_api_key=loaded.massive_api_key,
+        topstepx_api_key=loaded.topstepx_api_key,
+        topstepx_username=loaded.topstepx_username,
+        data_provider=loaded.data_provider,
+        broker_provider=loaded.broker_provider,
         openai_api_key=loaded.openai_api_key,
         openai_model=loaded.openai_model,
         default_symbol=loaded.default_symbol,

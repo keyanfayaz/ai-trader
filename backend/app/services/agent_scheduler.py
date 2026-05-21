@@ -38,3 +38,7 @@ class AgentScheduler:
                 self.agent_service.run_active_agents_cycle()
             except Exception as exc:
                 LOGGER.exception("Agent scheduler cycle failed: %s", exc)
+            try:
+                self.agent_service.run_mission_cycle()
+            except Exception as exc:
+                LOGGER.exception("Mission scheduler cycle failed: %s", exc)

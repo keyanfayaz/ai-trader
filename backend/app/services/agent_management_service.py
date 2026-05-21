@@ -6,10 +6,11 @@ from collections.abc import Callable
 from typing import Any, Literal
 from uuid import uuid4
 
-from app.clients.openai_client import build_agent_execution_plan
+from app.clients.openai_client import build_agent_execution_plan, evaluate_execution_checkpoint
 from app.repositories.json_agent_store import JsonAgentStore
 from app.services.agent_monitor_stream import AgentMonitorStream
 from app.services.market_research_service import MarketResearchService
+from app.services.skill_context import build_skill_prompt_block, normalize_skill_ids
 from app.services.strategy_dedup import build_strategy_fingerprint
 from app.services.trading_service import TradingService
 from app.settings import Settings
@@ -56,12 +57,14 @@ class AgentManagementService:
         market_research_service: MarketResearchService,
         trading_service: TradingService,
         monitor_stream: AgentMonitorStream | None = None,
+        skill_store: Any | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.market_research_service = market_research_service
         self.trading_service = trading_service
         self.monitor_stream = monitor_stream
+        self.skill_store = skill_store
 
     def create_agent(
         self,
@@ -71,13 +74,18 @@ class AgentManagementService:
         interval_seconds: int | None,
         name: str | None = None,
         generated: dict[str, Any] | None = None,
+        skill_ids: list[str] | None = None,
+        asset_class: Literal["stock", "future"] = "stock",
     ) -> dict[str, Any]:
+        normalized_skill_ids = normalize_skill_ids(skill_ids)
         generated_payload = generated or self.generate_agent_draft(
             symbols=symbols,
             timeframe=timeframe,
             risk_profile=risk_profile,
             interval_seconds=interval_seconds,
             name=name,
+            skill_ids=normalized_skill_ids,
+            asset_class=asset_class,
         )
         created_at = _now_iso()
         self._ensure_strategy_is_unique(generated_payload=generated_payload)
@@ -92,6 +100,7 @@ class AgentManagementService:
             "symbols": generated_payload["symbols"],
             "ticker": generated_payload["ticker"],
             "timeframe": generated_payload["timeframe"],
+            "asset_class": generated_payload.get("asset_class", asset_class) or "stock",
             "risk_profile": generated_payload["risk_profile"],
             "interval_seconds": int(generated_payload["interval_seconds"]),
             "signal_context": generated_payload["signal_context"],
@@ -100,6 +109,7 @@ class AgentManagementService:
             "execution_plan": generated_payload["execution_plan"],
             "research_refs": generated_payload.get("research_refs", []),
             "research_thoughts": generated_payload.get("research_thoughts", []),
+            "skill_ids": normalized_skill_ids,
             "created_at": created_at,
             "updated_at": created_at,
             "last_run_at": None,
@@ -116,9 +126,13 @@ class AgentManagementService:
         interval_seconds: int | None = None,
         name: str | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        skill_ids: list[str] | None = None,
+        asset_class: Literal["stock", "future"] = "stock",
     ) -> dict[str, Any]:
         resolved_risk_profile = (risk_profile or "balanced").strip().lower()
         run_interval = interval_seconds or self.settings.agent_run_interval_seconds
+        normalized_skill_ids = normalize_skill_ids(skill_ids)
+        resolved_asset_class = asset_class if asset_class in ("stock", "future") else "stock"
 
         if symbols:
             research_result = self.market_research_service.build_strategy(
@@ -126,12 +140,16 @@ class AgentManagementService:
                 timeframe=timeframe,
                 risk_profile=resolved_risk_profile,
                 progress_callback=progress_callback,
+                skill_ids=normalized_skill_ids,
+                asset_class=resolved_asset_class,
             )
         else:
             research_result = self.market_research_service.generate_buy_candidate_strategy(
                 timeframe=timeframe,
                 risk_profile=resolved_risk_profile,
                 progress_callback=progress_callback,
+                skill_ids=normalized_skill_ids,
+                asset_class=resolved_asset_class,
             )
 
         if not research_result.symbols:
@@ -148,6 +166,7 @@ class AgentManagementService:
             "symbols": research_result.symbols,
             "ticker": research_result.ticker,
             "timeframe": research_result.timeframe,
+            "asset_class": resolved_asset_class,
             "risk_profile": resolved_risk_profile,
             "interval_seconds": run_interval,
             "signal_context": research_result.signal_context,
@@ -158,6 +177,533 @@ class AgentManagementService:
             "research_thoughts": research_result.research_thoughts,
             "quality_findings": research_result.quality_findings,
         }
+
+    # ------------------------------------------------------------------ #
+    # Mission lifecycle: research → approve → time-boxed execution → stop
+    # ------------------------------------------------------------------ #
+
+    def generate_mission_draft(
+        self,
+        symbols: list[str] | None = None,
+        theme: str | None = None,
+        timeframe: str | None = None,
+        risk_profile: str | None = None,
+        skill_ids: list[str] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        asset_class: Literal["stock", "future"] = "stock",
+    ) -> dict[str, Any]:
+        resolved_risk = (risk_profile or "balanced").strip().lower()
+        normalized_skill_ids = normalize_skill_ids(skill_ids)
+        resolved_asset_class = asset_class if asset_class in ("stock", "future") else "stock"
+        result = self.market_research_service.build_mission(
+            symbols=symbols,
+            theme=theme,
+            timeframe=timeframe,
+            risk_profile=resolved_risk,
+            skill_ids=normalized_skill_ids,
+            progress_callback=progress_callback,
+            asset_class=resolved_asset_class,
+        )
+        focus = result.input_theme or result.ticker
+        return {
+            "name": f"{focus} mission ({resolved_risk})".strip(),
+            "symbols": result.symbols,
+            "ticker": result.ticker,
+            "timeframe": result.timeframe,
+            "asset_class": resolved_asset_class,
+            "risk_profile": result.risk_profile,
+            "input_kind": result.input_kind,
+            "input_theme": result.input_theme,
+            "theme_summary": result.theme_summary,
+            "basket": result.basket,
+            "signal_context": result.signal_context,
+            "strategy": result.strategy,
+            "strategy_evaluation": result.evaluation,
+            "execution_plan": result.execution_plan,
+            "window_seconds": result.window_seconds,
+            "window_rationale": result.window_rationale,
+            "skill_markdown": result.skill_markdown,
+            "research_refs": result.research_refs,
+            "research_thoughts": result.research_thoughts,
+            "preset_skill_ids": normalized_skill_ids,
+        }
+
+    def create_mission_agent(
+        self,
+        draft: dict[str, Any],
+        skill_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_skill_ids = normalize_skill_ids(
+            skill_ids if skill_ids is not None else draft.get("preset_skill_ids")
+        )
+        generated_skill_id: str | None = None
+        skill_md = str(draft.get("skill_markdown", "")).strip()
+        if skill_md and self.skill_store is not None:
+            try:
+                meta = self.skill_store.create_from_editor(markdown=skill_md)
+                generated_skill_id = str(meta.get("id"))
+                if generated_skill_id and generated_skill_id not in normalized_skill_ids:
+                    normalized_skill_ids = [*normalized_skill_ids, generated_skill_id]
+            except Exception as exc:
+                LOGGER.warning("Failed to persist authored strategy skill: %s", exc)
+
+        created_at = _now_iso()
+        agent_id = str(uuid4())
+        window_seconds = int(
+            draft.get("window_seconds")
+            or draft.get("execution_plan", {}).get("recommended_window_seconds")
+            or self.settings.mission_window_default_seconds
+        )
+        record = {
+            "agent_id": agent_id,
+            "name": str(draft.get("name", "Mission agent")).strip(),
+            "status": "paused",
+            "mission_status": "awaiting_approval",
+            "input_kind": draft.get("input_kind", "auto"),
+            "input_theme": draft.get("input_theme"),
+            "theme_summary": draft.get("theme_summary", ""),
+            "basket": draft.get("basket", []),
+            "startup_pause_pending": False,
+            "startup_pause_at": None,
+            "startup_pause_source_status": None,
+            "symbols": draft.get("symbols", []),
+            "ticker": draft.get("ticker", ""),
+            "timeframe": draft.get("timeframe", self.settings.bar_timeframe),
+            "asset_class": str(draft.get("asset_class") or "stock"),
+            "risk_profile": draft.get("risk_profile", "balanced"),
+            "interval_seconds": int(self.settings.mission_tick_seconds),
+            "signal_context": draft.get("signal_context", []),
+            "strategy": draft.get("strategy", {}),
+            "strategy_evaluation": draft.get("strategy_evaluation", {}),
+            "execution_plan": draft.get("execution_plan", {}),
+            "strategy_window_seconds": window_seconds,
+            "window_rationale": draft.get("window_rationale", ""),
+            "window_started_at": None,
+            "window_ends_at": None,
+            "approved_at": None,
+            "last_checkpoint_at": None,
+            "last_mission_tick_at": None,
+            "mission_entry_prices": {},
+            "decision_log": [],
+            "terminal_reason": None,
+            "generated_skill_id": generated_skill_id,
+            "research_refs": draft.get("research_refs", []),
+            "research_thoughts": draft.get("research_thoughts", []),
+            "skill_ids": normalized_skill_ids,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "last_run_at": None,
+            "runs": [],
+        }
+        self.store.save_agent(record)
+        self._publish_event(
+            event="mission_status_changed",
+            agent_id=agent_id,
+            payload={"mission_status": "awaiting_approval"},
+        )
+        return record
+
+    def approve_mission(
+        self,
+        agent_id: str,
+        window_seconds_override: int | None = None,
+    ) -> dict[str, Any]:
+        record = self.get_agent(agent_id)
+        if record.get("mission_status") != "awaiting_approval":
+            raise InvalidGeneratedDraftError(
+                f"Agent {agent_id} is not awaiting approval (state={record.get('mission_status')})."
+            )
+        window = int(
+            record.get("strategy_window_seconds") or self.settings.mission_window_default_seconds
+        )
+        if window_seconds_override is not None:
+            window = max(
+                self.settings.mission_window_min_seconds,
+                min(self.settings.mission_window_max_seconds, int(window_seconds_override)),
+            )
+        record["strategy_window_seconds"] = window
+        record["mission_status"] = "armed"
+        record["status"] = "active"
+        record["approved_at"] = _now_iso()
+        record["updated_at"] = _now_iso()
+        self._append_decision_log(record, "lifecycle", "", "approved", f"Approved with {window}s window")
+        updated = self.store.save_agent(record)
+        self._publish_event(
+            event="mission_status_changed",
+            agent_id=agent_id,
+            payload={"mission_status": "armed", "window_seconds": window},
+        )
+        return updated
+
+    def reject_mission(self, agent_id: str) -> dict[str, Any]:
+        record = self.get_agent(agent_id)
+        record["mission_status"] = "rejected"
+        record["status"] = "paused"
+        record["terminal_reason"] = "rejected_by_user"
+        record["updated_at"] = _now_iso()
+        self._append_decision_log(record, "lifecycle", "", "rejected", "Rejected by user")
+        updated = self.store.save_agent(record)
+        self._publish_event(
+            event="mission_status_changed",
+            agent_id=agent_id,
+            payload={"mission_status": "rejected"},
+        )
+        return updated
+
+    def run_mission_cycle(self) -> list[dict[str, Any]]:
+        updated: list[dict[str, Any]] = []
+        now = datetime.now(UTC)
+        for agent in self.list_agents():
+            if agent.get("mission_status") not in {"armed", "executing"}:
+                continue
+            try:
+                stepped = self._mission_step(agent, now)
+                if stepped is not None:
+                    updated.append(stepped)
+            except Exception as exc:
+                LOGGER.exception("Mission %s step failed: %s", agent.get("agent_id"), exc)
+        return updated
+
+    def _mission_step(self, agent: dict[str, Any], now: datetime) -> dict[str, Any] | None:
+        agent_id = str(agent.get("agent_id", ""))
+        market = self._resolve_market_runtime()
+        is_open = bool(market.get("is_market_open", False))
+
+        if agent.get("mission_status") == "armed":
+            if not is_open:
+                return None
+            window = int(
+                agent.get("strategy_window_seconds") or self.settings.mission_window_default_seconds
+            )
+            agent["mission_status"] = "executing"
+            agent["window_started_at"] = now.isoformat()
+            agent["window_ends_at"] = (now + timedelta(seconds=window)).isoformat()
+            agent["updated_at"] = now.isoformat()
+            self._append_decision_log(
+                agent, "window", "", "window_started", f"Execution window opened ({window}s)"
+            )
+            self.store.save_agent(agent)
+            self._publish_event(
+                event="mission_window_started",
+                agent_id=agent_id,
+                payload={"window_ends_at": agent["window_ends_at"]},
+            )
+            self._publish_event(
+                event="mission_status_changed",
+                agent_id=agent_id,
+                payload={"mission_status": "executing"},
+            )
+
+        if agent.get("mission_status") != "executing":
+            return None
+
+        window_ends = _parse_optional_iso_datetime(agent.get("window_ends_at"))
+        if window_ends is not None and now >= window_ends:
+            return self._flatten_mission(agent, now, "window_expired")
+        if not is_open:
+            return self._flatten_mission(agent, now, "market_closed")
+
+        last_tick = _parse_optional_iso_datetime(agent.get("last_mission_tick_at"))
+        if (
+            last_tick is not None
+            and (now - last_tick).total_seconds() < self.settings.mission_tick_seconds
+        ):
+            return None
+        agent["last_mission_tick_at"] = now.isoformat()
+
+        timeframe = str(agent.get("timeframe") or self.settings.bar_timeframe)
+        asset_class = self._agent_asset_class(agent)
+        positions = {
+            str(p.get("symbol", "")).upper(): p for p in self.trading_service.get_open_positions()
+        }
+        legs = agent.get("execution_plan", {}).get("legs", []) or []
+        entry_prices: dict[str, Any] = agent.setdefault("mission_entry_prices", {})
+
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            symbol = str(leg.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            latest = self._latest_close(symbol, timeframe, asset_class)
+            if latest <= 0:
+                continue
+            pos = positions.get(symbol)
+            held_qty = float(pos.get("qty", 0.0) or 0.0) if pos else 0.0
+
+            if held_qty <= 0.0:
+                if not self._entry_ready(leg, latest):
+                    continue
+                qty = self._mission_qty(agent, leg, latest)
+                if qty <= 0.0:
+                    continue
+                order = self.trading_service.execute_signal_order(
+                    symbol=symbol, signal="BUY", qty=qty, asset_class=asset_class
+                ) or {}
+                filled = float(order.get("filled_qty", 0.0) or 0.0)
+                filled_px = order.get("filled_avg_price")
+                entry_px = float(filled_px) if filled_px else latest
+                entry_prices[symbol] = entry_px
+                self._append_decision_log(
+                    agent,
+                    "entry",
+                    symbol,
+                    "position_opened",
+                    f"Bought {filled or qty} @ {entry_px:.4f}",
+                    order,
+                )
+                self._publish_event(
+                    event="mission_position_opened",
+                    agent_id=agent_id,
+                    payload={"symbol": symbol, "qty": filled or qty, "price": entry_px},
+                )
+                continue
+
+            entry_px = float(
+                entry_prices.get(symbol) or pos.get("avg_entry_price", latest) or latest
+            )
+            target_px = entry_px * (1.0 + float(leg.get("target_pct", 0.0)) / 100.0)
+            stop_px = entry_px * (1.0 - float(leg.get("stop_pct", 0.0)) / 100.0)
+            if latest >= target_px or latest <= stop_px:
+                order = self.trading_service.execute_signal_order(
+                    symbol=symbol, signal="SELL", qty=held_qty, asset_class=asset_class
+                ) or {}
+                reason = "target_hit" if latest >= target_px else "stop_hit"
+                self._append_decision_log(
+                    agent,
+                    "exit",
+                    symbol,
+                    reason,
+                    f"Sold {held_qty} @ {latest:.4f} (entry {entry_px:.4f})",
+                    order,
+                )
+                self._publish_event(
+                    event="mission_position_closed",
+                    agent_id=agent_id,
+                    payload={"symbol": symbol, "qty": held_qty, "price": latest, "reason": reason},
+                )
+
+        terminal = self._maybe_checkpoint(agent, now, positions, entry_prices)
+        if terminal is not None:
+            return terminal
+
+        agent["updated_at"] = now.isoformat()
+        return self.store.save_agent(agent)
+
+    def _flatten_mission(
+        self, agent: dict[str, Any], now: datetime, reason: str
+    ) -> dict[str, Any]:
+        agent_id = str(agent.get("agent_id", ""))
+        asset_class = self._agent_asset_class(agent)
+        positions = {
+            str(p.get("symbol", "")).upper(): p for p in self.trading_service.get_open_positions()
+        }
+        for leg in agent.get("execution_plan", {}).get("legs", []) or []:
+            if not isinstance(leg, dict):
+                continue
+            symbol = str(leg.get("symbol", "")).upper()
+            pos = positions.get(symbol)
+            held_qty = float(pos.get("qty", 0.0) or 0.0) if pos else 0.0
+            if held_qty <= 0.0:
+                continue
+            order = self.trading_service.execute_signal_order(
+                symbol=symbol, signal="SELL", qty=held_qty, asset_class=asset_class
+            ) or {}
+            self._append_decision_log(
+                agent, "exit", symbol, "position_closed", f"Flatten ({reason})", order
+            )
+            self._publish_event(
+                event="mission_position_closed",
+                agent_id=agent_id,
+                payload={"symbol": symbol, "qty": held_qty, "reason": reason},
+            )
+        agent["mission_status"] = "completed"
+        agent["status"] = "paused"
+        agent["terminal_reason"] = reason
+        agent["updated_at"] = now.isoformat()
+        self._append_decision_log(agent, "window", "", "mission_completed", f"Completed: {reason}")
+        updated = self.store.save_agent(agent)
+        self._publish_event(
+            event="mission_completed",
+            agent_id=agent_id,
+            payload={"reason": reason},
+        )
+        self._publish_event(
+            event="mission_status_changed",
+            agent_id=agent_id,
+            payload={"mission_status": "completed", "reason": reason},
+        )
+        return updated
+
+    def _maybe_checkpoint(
+        self,
+        agent: dict[str, Any],
+        now: datetime,
+        positions: dict[str, Any],
+        entry_prices: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        openai_client = getattr(self.market_research_service, "openai_client", None)
+        if openai_client is None:
+            return None
+        window = int(
+            agent.get("strategy_window_seconds") or self.settings.mission_window_default_seconds
+        )
+        checkpoint_interval = max(self.settings.mission_tick_seconds, window // 3)
+        last_cp = _parse_optional_iso_datetime(agent.get("last_checkpoint_at"))
+        due = last_cp is None or (now - last_cp).total_seconds() >= checkpoint_interval
+
+        move_triggered = False
+        for symbol, entry_px in entry_prices.items():
+            pos = positions.get(symbol)
+            try:
+                entry_val = float(entry_px)
+            except (TypeError, ValueError):
+                continue
+            if not pos or entry_val <= 0:
+                continue
+            current = float(pos.get("current_price", 0.0) or 0.0)
+            if current <= 0:
+                continue
+            if abs(current - entry_val) / entry_val * 100.0 >= self.settings.mission_checkpoint_move_pct:
+                move_triggered = True
+                break
+        if not (due or move_triggered):
+            return None
+
+        agent_id = str(agent.get("agent_id", ""))
+        skill_context = build_skill_prompt_block(self.skill_store, agent.get("skill_ids"))
+        state = {
+            "window_ends_at": agent.get("window_ends_at"),
+            "legs": agent.get("execution_plan", {}).get("legs", []),
+            "entry_prices": entry_prices,
+            "positions": [
+                {
+                    "symbol": s,
+                    "qty": float(p.get("qty", 0.0) or 0.0),
+                    "current_price": float(p.get("current_price", 0.0) or 0.0),
+                    "unrealized_pnl": float(p.get("unrealized_pnl", 0.0) or 0.0),
+                }
+                for s, p in positions.items()
+            ],
+        }
+        try:
+            decision = evaluate_execution_checkpoint(
+                client=openai_client,
+                model=self.settings.openai_model,
+                state=state,
+                skill_context=skill_context,
+            )
+        except Exception as exc:
+            LOGGER.warning("Mission %s checkpoint failed: %s", agent_id, exc)
+            agent["last_checkpoint_at"] = now.isoformat()
+            return None
+
+        agent["last_checkpoint_at"] = now.isoformat()
+        verdict = decision.get("decision", "continue")
+        self._append_decision_log(
+            agent,
+            "checkpoint",
+            "",
+            f"checkpoint_{verdict}",
+            decision.get("rationale", ""),
+        )
+        self._publish_event(
+            event="mission_checkpoint",
+            agent_id=agent_id,
+            payload=decision,
+        )
+
+        if verdict in {"abort", "take_profit"}:
+            return self._flatten_mission(agent, now, f"checkpoint_{verdict}")
+        if verdict == "tighten_stop":
+            new_stop = decision.get("stop_pct")
+            new_target = decision.get("target_pct")
+            for leg in agent.get("execution_plan", {}).get("legs", []) or []:
+                if not isinstance(leg, dict):
+                    continue
+                if new_stop:
+                    leg["stop_pct"] = abs(float(new_stop))
+                if new_target:
+                    leg["target_pct"] = abs(float(new_target))
+        return None
+
+    def _entry_ready(self, leg: dict[str, Any], latest_close: float) -> bool:
+        entry = leg.get("entry", {}) if isinstance(leg.get("entry"), dict) else {}
+        entry_type = str(entry.get("type", "market")).lower()
+        if entry_type != "limit":
+            return True
+        ref = entry.get("ref_price")
+        try:
+            ref_price = float(ref) if ref is not None else None
+        except (TypeError, ValueError):
+            ref_price = None
+        if ref_price is None or ref_price <= 0:
+            return True
+        return latest_close <= ref_price
+
+    def _mission_qty(self, agent: dict[str, Any], leg: dict[str, Any], latest_close: float) -> float:
+        if latest_close <= 0:
+            return 0.0
+        risk_profile = str(agent.get("risk_profile", "balanced")).lower()
+        exposure_limit = _RISK_EXPOSURE_LIMITS.get(risk_profile, _RISK_EXPOSURE_LIMITS["balanced"])
+        budget = float(self.settings.summary_starting_deposit) * exposure_limit
+        weight = float(leg.get("weight", 0.0) or 0.0)
+        if weight <= 0.0:
+            legs = agent.get("execution_plan", {}).get("legs", []) or []
+            weight = 1.0 / max(len(legs), 1)
+        notional = budget * weight
+        return round(max(notional / latest_close, 0.0), 6)
+
+    @staticmethod
+    def _agent_asset_class(agent: dict[str, Any]) -> str:
+        value = str(agent.get("asset_class") or "stock").strip().lower()
+        return value if value in ("stock", "future") else "stock"
+
+    def _latest_close(
+        self, symbol: str, timeframe: str, asset_class: str = "stock"
+    ) -> float:
+        try:
+            bars = self.trading_service.get_market_data(
+                symbol=symbol, timeframe=timeframe, asset_class=asset_class
+            )
+        except Exception as exc:
+            LOGGER.warning("Mission price fetch failed for %s: %s", symbol, exc)
+            return 0.0
+        if not bars:
+            return 0.0
+        try:
+            return float(bars[-1].get("c", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _append_decision_log(
+        self,
+        agent: dict[str, Any],
+        phase: str,
+        symbol: str,
+        action: str,
+        reason: str,
+        order: dict[str, Any] | None = None,
+    ) -> None:
+        log = agent.setdefault("decision_log", [])
+        entry: dict[str, Any] = {
+            "at": _now_iso(),
+            "phase": phase,
+            "symbol": symbol,
+            "action": action,
+            "reason": reason,
+        }
+        if order:
+            entry["order_id"] = order.get("id")
+            entry["filled_qty"] = float(order.get("filled_qty", 0.0) or 0.0)
+            filled_px = order.get("filled_avg_price")
+            try:
+                entry["filled_avg_price"] = float(filled_px) if filled_px is not None else None
+            except (TypeError, ValueError):
+                entry["filled_avg_price"] = None
+        log.append(entry)
+        if len(log) > 500:
+            agent["decision_log"] = log[-500:]
 
     def _ensure_strategy_is_unique(self, generated_payload: dict[str, Any]) -> None:
         research_refs = generated_payload.get("research_refs")
@@ -216,6 +762,25 @@ class AgentManagementService:
             raise KeyError(f"Agent {agent_id} not found.")
         return record
 
+    def set_agent_skills(self, agent_id: str, skill_ids: list[str] | None) -> dict[str, Any]:
+        record = self.get_agent(agent_id)
+        normalized = normalize_skill_ids(skill_ids)
+        if normalized and self.skill_store is not None:
+            for skill_id in normalized:
+                try:
+                    self.skill_store.get_skill(skill_id)
+                except Exception as exc:
+                    raise KeyError(f"Skill {skill_id} not found.") from exc
+        record["skill_ids"] = normalized
+        record["updated_at"] = _now_iso()
+        updated = self.store.save_agent(record)
+        self._publish_event(
+            event="agent_skills_changed",
+            agent_id=agent_id,
+            payload={"skill_ids": normalized},
+        )
+        return updated
+
     def activate_agent(self, agent_id: str) -> dict[str, Any]:
         record = self.get_agent(agent_id)
         record = self._maybe_run_activation_bootstrap(record)
@@ -241,6 +806,7 @@ class AgentManagementService:
         agent["activation_bootstrap_attempted_at"] = attempted_at
 
         timeframe = str(agent.get("timeframe") or self.settings.bar_timeframe)
+        asset_class = self._agent_asset_class(agent)
         symbol = str(agent.get("ticker") or "").upper().strip()
         if not symbol:
             symbols = [str(item).upper().strip() for item in agent.get("symbols", []) if str(item).strip()]
@@ -259,7 +825,9 @@ class AgentManagementService:
         filled_avg_price: float | None = None
 
         if symbol:
-            bars = self.trading_service.get_market_data(symbol=symbol, timeframe=timeframe)
+            bars = self.trading_service.get_market_data(
+                symbol=symbol, timeframe=timeframe, asset_class=asset_class
+            )
             if bars:
                 price = float(bars[-1].get("c", 0.0) or 0.0)
                 position_state = self._build_agent_position_state(agent)
@@ -275,6 +843,7 @@ class AgentManagementService:
                         symbol=symbol,
                         signal="BUY",
                         qty=approved_qty,
+                        asset_class=asset_class,
                     ) or {}
                     executed_side = str(order.get("side", "buy")).lower()
                     submitted_status = str(order.get("submitted_status", order.get("status", "")) or "")
@@ -405,6 +974,9 @@ class AgentManagementService:
         for agent in self.list_agents():
             if agent.get("status") != "active":
                 continue
+            if agent.get("mission_status"):
+                # Mission agents are driven by run_mission_cycle, not the legacy SMA loop.
+                continue
             agent = self._maybe_refresh_strategy(agent=agent, now=now)
             runtime = self.get_agent_runtime(agent=agent, now=now)
             if not runtime["can_run_now"]:
@@ -499,6 +1071,7 @@ class AgentManagementService:
             agent["updated_at"] = _now_iso()
             self.store.save_agent(agent)
         timeframe = str(agent.get("timeframe") or self.settings.bar_timeframe)
+        asset_class = self._agent_asset_class(agent)
         plan_symbols = self._execution_plan_symbols(agent)
         symbols = plan_symbols or [str(sym).upper() for sym in agent.get("symbols", [])]
         position_state = self._build_agent_position_state(agent)
@@ -523,7 +1096,9 @@ class AgentManagementService:
             spent = 0.0
             earned = 0.0
             for symbol in symbols:
-                bars = self.trading_service.get_market_data(symbol=symbol, timeframe=timeframe)
+                bars = self.trading_service.get_market_data(
+                    symbol=symbol, timeframe=timeframe, asset_class=asset_class
+                )
                 signal_result = self.trading_service.calculate_signal(bars)
                 price = float(signal_result.latest_close)
                 signal = str(signal_result.signal).upper()
@@ -587,6 +1162,7 @@ class AgentManagementService:
                         symbol=symbol,
                         signal=signal,
                         qty=approved_qty,
+                        asset_class=asset_class,
                     )
                     order = submitted or {}
                     executed_side = str(order.get("side", side)).lower()
@@ -867,6 +1443,8 @@ class AgentManagementService:
                 timeframe=str(agent.get("timeframe") or self.settings.bar_timeframe),
                 risk_profile=str(agent.get("risk_profile") or "balanced"),
                 research_scope="runtime",
+                skill_ids=normalize_skill_ids(agent.get("skill_ids")),
+                asset_class=self._agent_asset_class(agent),
             )
             refreshed_execution_plan = build_agent_execution_plan(
                 strategy=refreshed.strategy,

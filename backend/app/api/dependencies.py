@@ -3,11 +3,17 @@ from __future__ import annotations
 from functools import lru_cache
 
 from app.clients.alpaca_client import AlpacaClient
+from app.clients.providers.alpaca_provider import AlpacaProvider
+from app.clients.providers.base import BrokerProvider, MarketDataProvider
+from app.clients.providers.databento_provider import DatabentoProvider
+from app.clients.providers.massive_provider import MassiveProvider
+from app.clients.providers.topstepx_provider import TopStepXProvider
 from app.clients.openai_client import build_openai_client
 from app.logging_config import configure_logging
 from app.repositories.json_agent_store import JsonAgentStore
 from app.repositories.markdown_research_store import MarkdownResearchStore
 from app.repositories.runtime_config_store import RuntimeConfigStore
+from app.repositories.skill_store import SkillStore
 from app.services.agent_management_service import AgentManagementService
 from app.services.agent_monitor_stream import AgentMonitorStream
 from app.services.agent_scheduler import AgentScheduler
@@ -29,6 +35,8 @@ def get_runtime_config_store() -> RuntimeConfigStore:
     return RuntimeConfigStore(
         file_path=settings.runtime_config_path,
         default_trading_mode=settings.trading_mode,
+        default_data_provider=settings.data_provider,
+        default_broker_provider=settings.broker_provider,
     )
 
 
@@ -60,6 +68,46 @@ def get_alpaca_client() -> AlpacaClient:
     return _build_alpaca_client_for_mode(get_trading_mode())
 
 
+def get_provider_selection() -> dict[str, str]:
+    store = get_runtime_config_store()
+    return {
+        "data_provider": store.get_data_provider(),
+        "broker_provider": store.get_broker_provider(),
+    }
+
+
+def _build_data_provider(provider_id: str) -> MarketDataProvider:
+    settings = get_settings()
+    if provider_id == "databento":
+        return DatabentoProvider(api_key=settings.databento_api_key)
+    if provider_id == "massive":
+        return MassiveProvider(api_key=settings.massive_api_key)
+    if provider_id == "topstepx":
+        return TopStepXProvider(
+            api_key=settings.topstepx_api_key,
+            username=settings.topstepx_username,
+        )
+    return AlpacaProvider(get_alpaca_client())
+
+
+def _build_broker_provider(provider_id: str) -> BrokerProvider:
+    settings = get_settings()
+    if provider_id == "topstepx":
+        return TopStepXProvider(
+            api_key=settings.topstepx_api_key,
+            username=settings.topstepx_username,
+        )
+    return AlpacaProvider(get_alpaca_client())
+
+
+def get_data_provider() -> MarketDataProvider:
+    return _build_data_provider(get_runtime_config_store().get_data_provider())
+
+
+def get_broker_provider() -> BrokerProvider:
+    return _build_broker_provider(get_runtime_config_store().get_broker_provider())
+
+
 @lru_cache
 def get_openai_client():
     settings = get_settings()
@@ -69,17 +117,25 @@ def get_openai_client():
 def get_trading_service() -> TradingService:
     return TradingService(
         settings=get_settings(),
-        alpaca_client_provider=get_alpaca_client,
         openai_client=get_openai_client(),
+        broker_provider_provider=get_broker_provider,
+        data_provider_provider=get_data_provider,
     )
+
+
+@lru_cache
+def get_skill_store() -> SkillStore:
+    settings = get_settings()
+    return SkillStore(base_dir=settings.skills_store_dir)
 
 
 def get_market_research_service() -> MarketResearchService:
     return MarketResearchService(
         settings=get_settings(),
-        alpaca_client=get_alpaca_client(),
+        data_provider_factory=get_data_provider,
         research_store=get_research_store(),
         openai_client=get_openai_client(),
+        skill_store=get_skill_store(),
     )
 
 
@@ -110,6 +166,7 @@ def get_agent_management_service() -> AgentManagementService:
         market_research_service=get_market_research_service(),
         trading_service=get_trading_service(),
         monitor_stream=get_agent_monitor_stream(),
+        skill_store=get_skill_store(),
     )
 
 
@@ -118,5 +175,7 @@ def get_agent_scheduler() -> AgentScheduler:
     settings = get_settings()
     return AgentScheduler(
         agent_service=get_agent_management_service(),
-        interval_seconds=settings.agent_run_interval_seconds,
+        interval_seconds=min(
+            settings.agent_run_interval_seconds, settings.mission_tick_seconds
+        ),
     )

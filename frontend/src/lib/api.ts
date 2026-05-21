@@ -7,12 +7,16 @@ import type {
   AgentMonitorEvent,
   AgentMonitorResponse,
   CreateAgentPayload,
+  MissionDraft,
   PositionsResponse,
   ResearchRecordDetail,
   ResearchRecordDeleteResponse,
   ResearchRecordsDeleteResponse,
   ResearchRecordTreeResponse,
   ResearchRecordUpdateResponse,
+  SkillDetail,
+  ProviderSelection,
+  SkillListResponse,
   SummaryResponse,
   TradingMode,
   TradingModeResponse,
@@ -164,6 +168,111 @@ export function streamGenerateAgentStrategy(callbacks: GenerateStreamCallbacks):
   };
 }
 
+type MissionInput = {
+  theme?: string;
+  symbols?: string[];
+  riskProfile?: string;
+  skillIds?: string[];
+  assetClass?: "stock" | "future";
+};
+
+type MissionStreamCallbacks = {
+  onThought: (thought: Record<string, unknown>) => void;
+  onCompleted: (draft: MissionDraft) => void;
+  onFailed: (error: string) => void;
+  onError?: (error: string) => void;
+};
+
+export function streamGenerateMission(
+  input: MissionInput,
+  callbacks: MissionStreamCallbacks,
+): () => void {
+  const params = new URLSearchParams();
+  if (input.theme) params.set("theme", input.theme);
+  if (input.symbols?.length) params.set("symbols", input.symbols.join(","));
+  if (input.riskProfile) params.set("risk_profile", input.riskProfile);
+  params.set("asset_class", input.assetClass ?? "stock");
+  if (input.skillIds?.length) params.set("skill_ids", input.skillIds.join(","));
+  const source = new EventSource(
+    `${BASE_URL}/api/v1/agents/mission/generate/stream?${params.toString()}`,
+  );
+  let finished = false;
+
+  const thoughtHandler: EventListener = (rawEvent) => {
+    const event = rawEvent as MessageEvent<string>;
+    try {
+      const payload = JSON.parse(event.data) as { payload?: Record<string, unknown> };
+      callbacks.onThought(payload.payload ?? {});
+    } catch {
+      callbacks.onError?.("Unable to parse research thought event.");
+    }
+  };
+  const completedHandler: EventListener = (rawEvent) => {
+    const event = rawEvent as MessageEvent<string>;
+    try {
+      const payload = JSON.parse(event.data) as { payload?: { draft?: MissionDraft } };
+      if (!payload.payload?.draft) {
+        callbacks.onFailed("Mission stream completed without a draft.");
+        return;
+      }
+      callbacks.onCompleted(payload.payload.draft);
+    } catch {
+      callbacks.onFailed("Unable to parse mission completion payload.");
+    } finally {
+      finished = true;
+      source.close();
+    }
+  };
+  const failedHandler: EventListener = (rawEvent) => {
+    const event = rawEvent as MessageEvent<string>;
+    try {
+      const payload = JSON.parse(event.data) as { payload?: { error?: string } };
+      callbacks.onFailed(payload.payload?.error ?? "Mission generation failed.");
+    } catch {
+      callbacks.onFailed("Mission generation failed.");
+    } finally {
+      finished = true;
+      source.close();
+    }
+  };
+
+  source.addEventListener("research_thought", thoughtHandler);
+  source.addEventListener("generate_completed", completedHandler);
+  source.addEventListener("generate_failed", failedHandler);
+  source.onerror = () => {
+    if (finished || source.readyState === EventSource.CLOSED) {
+      return;
+    }
+    callbacks.onError?.("Mission stream disconnected.");
+  };
+
+  return () => {
+    finished = true;
+    source.removeEventListener("research_thought", thoughtHandler);
+    source.removeEventListener("generate_completed", completedHandler);
+    source.removeEventListener("generate_failed", failedHandler);
+    source.close();
+  };
+}
+
+export function createMission(draft: MissionDraft, skillIds?: string[]): Promise<Agent> {
+  return request<Agent>("/api/v1/agents/mission", {
+    method: "POST",
+    body: JSON.stringify({ draft, skill_ids: skillIds ?? null }),
+  });
+}
+
+export function approveMission(agentId: string, windowSeconds?: number): Promise<Agent> {
+  return request<Agent>(`/api/v1/agents/${agentId}/approve`, {
+    method: "POST",
+    body: JSON.stringify({ window_seconds: windowSeconds ?? null }),
+  });
+}
+
+export function rejectMission(agentId: string): Promise<Agent> {
+  return request<Agent>(`/api/v1/agents/${agentId}/reject`, { method: "POST" });
+}
+
 export function listAgents(): Promise<AgentListResponse> {
   return request<AgentListResponse>("/api/v1/agents");
 }
@@ -244,6 +353,58 @@ export function deleteResearchFolder(folder: string): Promise<ResearchRecordsDel
   });
 }
 
+export function listSkills(): Promise<SkillListResponse> {
+  return request<SkillListResponse>("/api/v1/skills");
+}
+
+export function getSkill(skillId: string): Promise<SkillDetail> {
+  return request<SkillDetail>(`/api/v1/skills/${skillId}`);
+}
+
+export async function uploadSkill(formData: FormData): Promise<SkillDetail> {
+  const response = await fetch(`${BASE_URL}/api/v1/skills`, {
+    method: "POST",
+    body: formData,
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Backend request failed (${response.status}): ${body}`);
+  }
+  return (await response.json()) as SkillDetail;
+}
+
+export function createSkillFromEditor(markdown: string, name?: string): Promise<SkillDetail> {
+  return request<SkillDetail>("/api/v1/skills/editor", {
+    method: "POST",
+    body: JSON.stringify({ markdown, name: name ?? null }),
+  });
+}
+
+export function updateSkill(
+  skillId: string,
+  markdown: string,
+  expectedVersion: string | null,
+): Promise<SkillDetail> {
+  return request<SkillDetail>(`/api/v1/skills/${skillId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ markdown, expected_version: expectedVersion }),
+  });
+}
+
+export function deleteSkill(skillId: string): Promise<{ skill_id: string; deleted: boolean }> {
+  return request<{ skill_id: string; deleted: boolean }>(`/api/v1/skills/${skillId}`, {
+    method: "DELETE",
+  });
+}
+
+export function setAgentSkills(agentId: string, skillIds: string[]): Promise<Agent> {
+  return request<Agent>(`/api/v1/agents/${agentId}/skills`, {
+    method: "PUT",
+    body: JSON.stringify({ skill_ids: skillIds }),
+  });
+}
+
 export function getTradingMode(): Promise<TradingModeResponse> {
   return request<TradingModeResponse>("/api/v1/settings/trading-mode");
 }
@@ -252,6 +413,19 @@ export function setTradingMode(tradingMode: TradingMode): Promise<TradingModeRes
   return request<TradingModeResponse>("/api/v1/settings/trading-mode", {
     method: "PATCH",
     body: JSON.stringify({ trading_mode: tradingMode }),
+  });
+}
+
+export function getProviders(): Promise<ProviderSelection> {
+  return request<ProviderSelection>("/api/v1/settings/providers");
+}
+
+export function setProviderSelection(
+  selection: { data_provider?: string; broker_provider?: string },
+): Promise<ProviderSelection> {
+  return request<ProviderSelection>("/api/v1/settings/providers", {
+    method: "PATCH",
+    body: JSON.stringify(selection),
   });
 }
 
@@ -270,6 +444,12 @@ const MONITOR_EVENT_NAMES = [
   "agent_followup_triggered",
   "agent_strategy_refreshed",
   "agent_strategy_refresh_failed",
+  "mission_status_changed",
+  "mission_window_started",
+  "mission_position_opened",
+  "mission_position_closed",
+  "mission_checkpoint",
+  "mission_completed",
 ] as const;
 
 const FOLLOWUP_EVENT_NAMES = [

@@ -8,6 +8,14 @@ from typing import Any
 
 from app.clients.alpaca_client import AlpacaClient
 from app.clients.openai_client import explain_signal
+from app.clients.providers.alpaca_provider import AlpacaProvider
+from app.clients.providers.base import (
+    AssetClass,
+    BrokerProvider,
+    MarketDataProvider,
+    UnsupportedAssetClassError,
+    ViewOnlyProviderError,
+)
 from app.services.signal_service import SignalResult, calculate_sma_signal
 from app.settings import Settings
 
@@ -32,16 +40,26 @@ class TradingService:
         alpaca_client: AlpacaClient | None = None,
         alpaca_client_provider: Callable[[], AlpacaClient] | None = None,
         openai_client: Any | None = None,
+        broker_provider_provider: Callable[[], BrokerProvider] | None = None,
+        data_provider_provider: Callable[[], MarketDataProvider] | None = None,
     ) -> None:
         self.settings = settings
         self.alpaca_client = alpaca_client
         self.alpaca_client_provider = alpaca_client_provider
         self.openai_client = openai_client
-        if self.alpaca_client is None and self.alpaca_client_provider is None:
-            raise ValueError("TradingService requires alpaca_client or alpaca_client_provider.")
+        self.broker_provider_provider = broker_provider_provider
+        self.data_provider_provider = data_provider_provider
+        if (
+            self.alpaca_client is None
+            and self.alpaca_client_provider is None
+            and self.broker_provider_provider is None
+        ):
+            raise ValueError(
+                "TradingService requires a broker/data provider or an Alpaca client."
+            )
 
-    def get_market_runtime(self) -> dict[str, Any]:
-        clock = self._alpaca_client().get_market_clock()
+    def get_market_runtime(self, asset_class: AssetClass = "stock") -> dict[str, Any]:
+        clock = self._data().get_market_clock(asset_class=asset_class)
         is_open = bool(clock.get("is_open", False))
         return {
             "is_market_open": is_open,
@@ -51,27 +69,29 @@ class TradingService:
         }
 
     def get_account_overview(self) -> dict[str, Any]:
-        return self._alpaca_client().get_account_overview()
+        return self._broker().get_account_overview()
 
     def get_open_positions(self) -> list[dict[str, Any]]:
-        return self._alpaca_client().get_open_positions()
+        return self._broker().get_open_positions()
 
     def get_fill_activities(self, limit: int = 200) -> list[dict[str, Any]]:
-        return self._alpaca_client().get_account_activities(activity_types=["FILL"], limit=limit)
+        return self._broker().get_account_activities(activity_types=["FILL"], limit=limit)
 
     def get_market_data(
         self,
         symbol: str | None = None,
         timeframe: str | None = None,
         limit: int | None = None,
+        asset_class: AssetClass = "stock",
     ) -> list[dict[str, Any]]:
         chosen_symbol = self._resolve_symbol(symbol)
         chosen_timeframe = self._resolve_timeframe(timeframe)
         chosen_limit = limit or (self.settings.slow_sma_window + 5)
-        bars = self._alpaca_client().get_bars(
+        bars = self._data().get_bars(
             symbol=chosen_symbol,
             timeframe=chosen_timeframe,
             limit=chosen_limit,
+            asset_class=asset_class,
         )
         LOGGER.info(
             "Fetched %s bars for symbol=%s timeframe=%s limit=%s",
@@ -104,6 +124,7 @@ class TradingService:
         qty: float | None = None,
         order_type: str = "market",
         time_in_force: str = "day",
+        asset_class: AssetClass = "stock",
     ) -> dict[str, Any] | None:
         return self._submit_order(
             symbol=symbol,
@@ -111,6 +132,7 @@ class TradingService:
             qty=qty,
             order_type=order_type,
             time_in_force=time_in_force,
+            asset_class=asset_class,
         )
 
     def sell(
@@ -119,6 +141,7 @@ class TradingService:
         qty: float | None = None,
         order_type: str = "market",
         time_in_force: str = "day",
+        asset_class: AssetClass = "stock",
     ) -> dict[str, Any] | None:
         return self._submit_order(
             symbol=symbol,
@@ -126,6 +149,7 @@ class TradingService:
             qty=qty,
             order_type=order_type,
             time_in_force=time_in_force,
+            asset_class=asset_class,
         )
 
     def execute_signal_order(
@@ -133,12 +157,13 @@ class TradingService:
         symbol: str,
         signal: str,
         qty: float | None = None,
+        asset_class: AssetClass = "stock",
     ) -> dict[str, Any] | None:
         normalized_signal = signal.upper()
         if normalized_signal == "BUY":
-            return self.buy(symbol=symbol, qty=qty)
+            return self.buy(symbol=symbol, qty=qty, asset_class=asset_class)
         if normalized_signal == "SELL":
-            return self.sell(symbol=symbol, qty=qty)
+            return self.sell(symbol=symbol, qty=qty, asset_class=asset_class)
         LOGGER.info("Signal is %s. No order submitted.", normalized_signal)
         return None
 
@@ -188,17 +213,46 @@ class TradingService:
         qty: float | None,
         order_type: str,
         time_in_force: str,
+        asset_class: AssetClass = "stock",
     ) -> dict[str, Any]:
         normalized_symbol = self._resolve_symbol(symbol)
         chosen_qty = qty if qty is not None else self.settings.order_qty
 
-        submitted_order = self._alpaca_client().submit_order(
-            symbol=normalized_symbol,
-            qty=chosen_qty,
-            side=side,
-            order_type=order_type,
-            time_in_force=time_in_force,
-        )
+        try:
+            submitted_order = self._broker().submit_order(
+                symbol=normalized_symbol,
+                qty=chosen_qty,
+                side=side,
+                order_type=order_type,
+                time_in_force=time_in_force,
+                asset_class=asset_class,
+            )
+        except (ViewOnlyProviderError, UnsupportedAssetClassError) as exc:
+            reason = (
+                "broker_is_view_only"
+                if isinstance(exc, ViewOnlyProviderError)
+                else "broker_asset_class_unsupported"
+            )
+            LOGGER.warning(
+                "No order placed for %s (%s): %s",
+                normalized_symbol,
+                reason,
+                exc,
+            )
+            return {
+                "id": "",
+                "symbol": normalized_symbol,
+                "qty": chosen_qty,
+                "side": side,
+                "type": order_type,
+                "time_in_force": time_in_force,
+                "status": "skipped_view_only",
+                "submitted_status": "skipped_view_only",
+                "final_status": "skipped_view_only",
+                "filled_qty": 0.0,
+                "filled_avg_price": None,
+                "skipped_reason": reason,
+            }
         final_order = self._resolve_final_order_state(submitted_order)
         lifecycle_order = {
             **final_order,
@@ -264,9 +318,19 @@ class TradingService:
             raise RuntimeError("No Alpaca client configured.")
         return self.alpaca_client
 
+    def _data(self) -> MarketDataProvider:
+        if self.data_provider_provider is not None:
+            return self.data_provider_provider()
+        return AlpacaProvider(self._alpaca_client())
+
+    def _broker(self) -> BrokerProvider:
+        if self.broker_provider_provider is not None:
+            return self.broker_provider_provider()
+        return AlpacaProvider(self._alpaca_client())
+
     def _resolve_final_order_state(self, submitted_order: dict[str, Any]) -> dict[str, Any]:
         order_id = str(submitted_order.get("id", "")).strip()
-        if not order_id or not hasattr(self._alpaca_client(), "get_order"):
+        if not order_id or not hasattr(self._broker(), "get_order"):
             return submitted_order
         status = str(submitted_order.get("status", "")).lower()
         if _is_terminal_order_status(status):
@@ -277,7 +341,7 @@ class TradingService:
         for _ in range(max_attempts):
             time.sleep(0.2)
             try:
-                latest = self._alpaca_client().get_order(order_id)
+                latest = self._broker().get_order(order_id)
             except Exception:
                 break
             if _is_terminal_order_status(str(latest.get("status", "")).lower()):

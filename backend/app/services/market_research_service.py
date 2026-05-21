@@ -8,9 +8,19 @@ from collections.abc import Callable
 from typing import Any
 
 from app.clients.alpaca_client import AlpacaClient
-from app.clients.openai_client import evaluate_strategy_signal, research_trading_strategy
+from app.clients.providers.alpaca_provider import AlpacaProvider
+from app.clients.providers.base import AssetClass, MarketDataProvider
+from app.clients.openai_client import (
+    author_strategy_skill,
+    build_execution_plan,
+    evaluate_strategy_signal,
+    expand_theme_to_basket,
+    normalize_execution_plan,
+    research_trading_strategy,
+)
 from app.repositories.markdown_research_store import MarkdownResearchStore, ResearchRecord
 from app.services.signal_service import MarketSignalSummary, summarize_market_signal
+from app.services.skill_context import build_skill_prompt_block
 from app.services.strategy_dedup import build_strategy_fingerprint
 from app.settings import Settings
 
@@ -40,18 +50,65 @@ class MarketResearchResult:
     quality_findings: dict[str, Any] | None = None
 
 
+@dataclass(slots=True)
+class MissionResearchResult:
+    symbols: list[str]
+    ticker: str
+    timeframe: str
+    risk_profile: str
+    input_kind: str
+    input_theme: str | None
+    theme_summary: str
+    basket: list[dict[str, Any]]
+    signal_context: list[dict[str, Any]]
+    strategy: dict[str, Any]
+    evaluation: dict[str, Any]
+    execution_plan: dict[str, Any]
+    window_seconds: int
+    window_rationale: str
+    skill_markdown: str
+    research_refs: list[dict[str, Any]]
+    research_thoughts: list[dict[str, Any]]
+
+
 class MarketResearchService:
     def __init__(
         self,
         settings: Settings,
-        alpaca_client: AlpacaClient,
-        research_store: MarkdownResearchStore,
+        alpaca_client: AlpacaClient | None = None,
+        research_store: MarkdownResearchStore | None = None,
         openai_client: Any | None = None,
+        skill_store: Any | None = None,
+        data_provider: MarketDataProvider | None = None,
+        data_provider_factory: Callable[[], MarketDataProvider] | None = None,
     ) -> None:
         self.settings = settings
         self.alpaca_client = alpaca_client
+        # Resolve the data provider lazily so a selected-but-uncredentialed
+        # provider raises only when used (not at app/scheduler startup).
+        self._data_provider_factory = data_provider_factory
+        if data_provider is not None:
+            self._data_provider: MarketDataProvider | None = data_provider
+        elif alpaca_client is not None:
+            self._data_provider = AlpacaProvider(alpaca_client)
+        elif data_provider_factory is not None:
+            self._data_provider = None
+        else:
+            raise ValueError(
+                "MarketResearchService requires data_provider, "
+                "data_provider_factory, or alpaca_client."
+            )
         self.research_store = research_store
         self.openai_client = openai_client
+        self.skill_store = skill_store
+
+    @property
+    def data_provider(self) -> MarketDataProvider:
+        if self._data_provider is not None:
+            return self._data_provider
+        if self._data_provider_factory is None:
+            raise RuntimeError("No market data provider configured.")
+        return self._data_provider_factory()
 
     def build_strategy(
         self,
@@ -60,8 +117,11 @@ class MarketResearchService:
         risk_profile: str = "balanced",
         research_scope: str = _GENERATION_SCOPE,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        skill_ids: list[str] | None = None,
+        asset_class: AssetClass = "stock",
     ) -> MarketResearchResult:
         chosen_timeframe = timeframe or self.settings.bar_timeframe
+        skill_context = build_skill_prompt_block(self.skill_store, skill_ids)
         normalized_symbols = [symbol.upper() for symbol in symbols]
         self._emit_progress(
             progress_callback,
@@ -73,6 +133,7 @@ class MarketResearchService:
             symbols=normalized_symbols,
             timeframe=chosen_timeframe,
             progress_callback=progress_callback,
+            asset_class=asset_class,
         )
         self._emit_progress(
             progress_callback,
@@ -85,6 +146,8 @@ class MarketResearchService:
             timeframe=chosen_timeframe,
             risk_profile=risk_profile,
             signal_context=signal_context,
+            skill_context=skill_context,
+            asset_class=asset_class,
         )
         ticker = self._select_ticker(strategy=strategy, fallback_symbols=normalized_symbols)
         evaluation = self._build_strategy_evaluation(
@@ -93,6 +156,7 @@ class MarketResearchService:
             risk_profile=risk_profile,
             signal_context=signal_context,
             strategy=strategy,
+            skill_context=skill_context,
         )
         self._emit_progress(
             progress_callback,
@@ -138,16 +202,196 @@ class MarketResearchService:
             quality_findings=None,
         )
 
+    def build_mission(
+        self,
+        symbols: list[str] | None = None,
+        theme: str | None = None,
+        timeframe: str | None = None,
+        risk_profile: str = "balanced",
+        skill_ids: list[str] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        asset_class: AssetClass = "stock",
+    ) -> MissionResearchResult:
+        chosen_timeframe = timeframe or self.settings.bar_timeframe
+        skill_context = build_skill_prompt_block(self.skill_store, skill_ids)
+        normalized_theme = (theme or "").strip() or None
+
+        basket: list[dict[str, Any]] = []
+        theme_summary = ""
+        if normalized_theme:
+            input_kind = "theme"
+            self._emit_progress(
+                progress_callback,
+                stage="theme_expansion",
+                message=f"Expanding theme into a tradable basket: {normalized_theme}",
+                source="market_research_service",
+            )
+            if self.openai_client is not None:
+                expanded = expand_theme_to_basket(
+                    client=self.openai_client,
+                    model=self.settings.openai_model,
+                    theme=normalized_theme,
+                    risk_profile=risk_profile,
+                    skill_context=skill_context,
+                )
+                basket = expanded["basket"]
+                theme_summary = expanded["theme_summary"]
+                resolved_symbols = [str(item["symbol"]).upper() for item in basket]
+            else:
+                resolved_symbols = [s.upper() for s in (symbols or [self.settings.default_symbol])]
+                basket = [
+                    {"symbol": s, "rationale": "Theme expansion unavailable; using fallback.", "score": 0.5}
+                    for s in resolved_symbols
+                ]
+        elif symbols:
+            input_kind = "ticker"
+            resolved_symbols = [s.upper() for s in symbols]
+            basket = [{"symbol": s, "rationale": "User-specified symbol.", "score": 1.0} for s in resolved_symbols]
+        else:
+            input_kind = "auto"
+            resolved_symbols = [self.settings.default_symbol.upper()]
+            basket = [{"symbol": resolved_symbols[0], "rationale": "Default symbol.", "score": 0.5}]
+
+        self._emit_progress(
+            progress_callback,
+            stage="signal_scan",
+            message=f"Collecting signal context for {len(resolved_symbols)} symbol(s).",
+            source="signal_service",
+        )
+        signal_context = self._collect_signal_context(
+            symbols=resolved_symbols,
+            timeframe=chosen_timeframe,
+            progress_callback=progress_callback,
+            asset_class=asset_class,
+        )
+        active_symbols = [str(entry.get("symbol", "")).upper() for entry in signal_context if entry.get("symbol")]
+        if not active_symbols:
+            active_symbols = resolved_symbols
+
+        strategy = self._build_strategy_output(
+            symbols=active_symbols,
+            timeframe=chosen_timeframe,
+            risk_profile=risk_profile,
+            signal_context=signal_context,
+            skill_context=skill_context,
+            asset_class=asset_class,
+        )
+        ticker = self._select_ticker(strategy=strategy, fallback_symbols=active_symbols)
+        evaluation = self._build_strategy_evaluation(
+            ticker=ticker,
+            timeframe=chosen_timeframe,
+            risk_profile=risk_profile,
+            signal_context=signal_context,
+            strategy=strategy,
+            skill_context=skill_context,
+        )
+
+        self._emit_progress(
+            progress_callback,
+            stage="execution_plan",
+            message="Designing the time-boxed execution plan.",
+            source="market_research_service",
+        )
+        if self.openai_client is not None:
+            execution_plan = build_execution_plan(
+                client=self.openai_client,
+                model=self.settings.openai_model,
+                symbols=active_symbols,
+                signal_context=signal_context,
+                risk_profile=risk_profile,
+                window_min_seconds=self.settings.mission_window_min_seconds,
+                window_max_seconds=self.settings.mission_window_max_seconds,
+                window_default_seconds=self.settings.mission_window_default_seconds,
+                skill_context=skill_context,
+            )
+        else:
+            execution_plan = normalize_execution_plan(
+                parsed={},
+                fallback_symbols=active_symbols,
+                window_min_seconds=self.settings.mission_window_min_seconds,
+                window_max_seconds=self.settings.mission_window_max_seconds,
+                window_default_seconds=self.settings.mission_window_default_seconds,
+            )
+
+        skill_context_payload = {
+            "input_kind": input_kind,
+            "theme": normalized_theme,
+            "symbols": active_symbols,
+            "timeframe": chosen_timeframe,
+            "risk_profile": risk_profile,
+            "strategy": strategy,
+            "evaluation": evaluation,
+            "execution_plan": execution_plan,
+        }
+        if self.openai_client is not None:
+            skill_markdown = author_strategy_skill(
+                client=self.openai_client,
+                model=self.settings.openai_model,
+                context=skill_context_payload,
+                skill_context=skill_context,
+            )
+        else:
+            skill_markdown = _fallback_skill_markdown(
+                ticker=ticker,
+                theme=normalized_theme,
+                risk_profile=risk_profile,
+                execution_plan=execution_plan,
+            )
+
+        research_ref = self._persist_research_record(
+            source="build_mission",
+            symbols=active_symbols,
+            ticker=ticker,
+            timeframe=chosen_timeframe,
+            risk_profile=risk_profile,
+            signal_context=signal_context,
+            strategy=strategy,
+            evaluation=evaluation,
+            research_scope=_GENERATION_SCOPE,
+        )
+        research_thoughts = self._build_research_thoughts(
+            mode="mission",
+            symbols=active_symbols,
+            signal_context=signal_context,
+            strategy=strategy,
+            evaluation=evaluation,
+            selected_symbol=ticker,
+        )
+        return MissionResearchResult(
+            symbols=active_symbols,
+            ticker=ticker,
+            timeframe=chosen_timeframe,
+            risk_profile=risk_profile,
+            input_kind=input_kind,
+            input_theme=normalized_theme,
+            theme_summary=theme_summary,
+            basket=basket,
+            signal_context=signal_context,
+            strategy=strategy,
+            evaluation=evaluation,
+            execution_plan=execution_plan,
+            window_seconds=int(execution_plan.get("recommended_window_seconds", self.settings.mission_window_default_seconds)),
+            window_rationale=str(execution_plan.get("window_rationale", "")),
+            skill_markdown=skill_markdown,
+            research_refs=[research_ref],
+            research_thoughts=research_thoughts,
+        )
+
     def generate_buy_candidate_strategy(
         self,
         timeframe: str | None = None,
         risk_profile: str = "balanced",
         max_candidates: int | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        skill_ids: list[str] | None = None,
+        asset_class: AssetClass = "stock",
     ) -> MarketResearchResult:
         chosen_timeframe = timeframe or self.settings.bar_timeframe
+        skill_context = build_skill_prompt_block(self.skill_store, skill_ids)
         scan_limit = int(max_candidates or self.settings.research_candidate_scan_limit)
-        candidate_symbols = self.alpaca_client.list_active_tradable_equity_symbols(limit=scan_limit)
+        candidate_symbols = self.data_provider.list_tradable_symbols(
+            limit=scan_limit, asset_class=asset_class
+        )
         self._emit_progress(
             progress_callback,
             stage="start",
@@ -158,6 +402,7 @@ class MarketResearchService:
             symbols=candidate_symbols,
             timeframe=chosen_timeframe,
             progress_callback=progress_callback,
+            asset_class=asset_class,
         )
         quality_context = self._quality_universe(signal_context=signal_context)
         quality_findings = self._build_quality_findings(
@@ -188,6 +433,8 @@ class MarketResearchService:
                 timeframe=chosen_timeframe,
                 risk_profile=risk_profile,
                 signal_context=selected_context,
+                skill_context=skill_context,
+                asset_class=asset_class,
             )
             risk_warnings = strategy.get("risk_warnings")
             if not isinstance(risk_warnings, list):
@@ -207,6 +454,7 @@ class MarketResearchService:
                 risk_profile=risk_profile,
                 signal_context=selected_context,
                 strategy=strategy,
+                skill_context=skill_context,
             )
             raw_confidence = float(evaluation.get("confidence", 0.0) or 0.0)
             evaluation["confidence"] = min(raw_confidence, 0.45)
@@ -300,6 +548,7 @@ class MarketResearchService:
             timeframe=chosen_timeframe,
             risk_profile=risk_profile,
             signal_context=selected_context,
+            skill_context=skill_context,
         )
         evaluation = self._build_strategy_evaluation(
             ticker=selected_symbol,
@@ -307,6 +556,7 @@ class MarketResearchService:
             risk_profile=risk_profile,
             signal_context=selected_context,
             strategy=strategy,
+            skill_context=skill_context,
         )
         self._emit_progress(
             progress_callback,
@@ -417,15 +667,17 @@ class MarketResearchService:
         symbols: list[str],
         timeframe: str,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        asset_class: AssetClass = "stock",
     ) -> list[dict[str, Any]]:
         contexts: list[dict[str, Any]] = []
         bar_limit = max(self.settings.slow_sma_window + 5, 40)
         for symbol in symbols:
             try:
-                bars = self.alpaca_client.get_bars(
+                bars = self.data_provider.get_bars(
                     symbol=symbol,
                     timeframe=timeframe,
                     limit=bar_limit,
+                    asset_class=asset_class,
                 )
                 summary = summarize_market_signal(
                     bars=bars,
@@ -454,6 +706,8 @@ class MarketResearchService:
         timeframe: str,
         risk_profile: str,
         signal_context: list[dict[str, Any]],
+        skill_context: str | None = None,
+        asset_class: AssetClass = "stock",
     ) -> dict[str, Any]:
         if self.openai_client is None:
             return self._fallback_strategy(signal_context)
@@ -465,6 +719,8 @@ class MarketResearchService:
             timeframe=timeframe,
             risk_profile=risk_profile,
             signal_context=signal_context,
+            skill_context=skill_context,
+            asset_class=asset_class,
         )
 
     def _summary_to_context(
@@ -542,6 +798,7 @@ class MarketResearchService:
         risk_profile: str,
         signal_context: list[dict[str, Any]],
         strategy: dict[str, Any],
+        skill_context: str | None = None,
     ) -> dict[str, Any]:
         threshold = 0.70
         if self.openai_client is None:
@@ -556,6 +813,7 @@ class MarketResearchService:
                 risk_profile=risk_profile,
                 signal_context=signal_context,
                 strategy=strategy,
+                skill_context=skill_context,
             )
             confidence = float(evaluated.get("confidence", 0.0) or 0.0)
             recommendation = "recommended" if confidence >= threshold else "not_recommended"
@@ -843,3 +1101,32 @@ class MarketResearchService:
                 "source": source,
             }
         )
+
+
+def _fallback_skill_markdown(
+    ticker: str,
+    theme: str | None,
+    risk_profile: str,
+    execution_plan: dict[str, Any],
+) -> str:
+    legs = execution_plan.get("legs", []) if isinstance(execution_plan, dict) else []
+    leg_lines = [
+        f"- {leg.get('symbol')}: target {leg.get('target_pct')}% / stop {leg.get('stop_pct')}%"
+        for leg in legs
+        if isinstance(leg, dict)
+    ]
+    window = execution_plan.get("recommended_window_seconds", 1800)
+    focus = theme or ticker
+    return (
+        "---\n"
+        f"name: mission-{str(ticker or 'strategy').strip().lower()[:48] or 'strategy'}\n"
+        f"description: Time-boxed momentum strategy for {focus} "
+        f"({risk_profile} risk), generated as a fallback without model access.\n"
+        "---\n\n"
+        f"# Mission Strategy: {focus}\n\n"
+        f"Holding window: ~{int(window) // 60} minutes. Always exit every leg by the "
+        "window end; respect each leg's target and stop.\n\n"
+        "## Legs\n\n" + ("\n".join(leg_lines) if leg_lines else "- (none)") + "\n\n"
+        "## Risk\n\nFlatten everything at the window deadline. Buy first since the "
+        "account starts flat.\n"
+    )

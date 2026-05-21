@@ -12,6 +12,8 @@ const NAV_ITEMS = [
   { href: "/agents", label: "Agents" },
   { href: "/overview", label: "Overview" },
   { href: "/research", label: "Research" },
+  { href: "/skills", label: "Skills" },
+  { href: "/settings", label: "Settings" },
 ];
 
 export function Sidebar() {
