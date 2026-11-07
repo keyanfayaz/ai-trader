@@ -4,6 +4,12 @@ A local trading workspace with a FastAPI backend and Next.js dashboard. Generate
 strategy drafts, inspect research, manage trading agents, and monitor an Alpaca
 account from one interface.
 
+![Auto Trader’s new-mission screen](docs/screenshots/new-mission.png)
+
+The actual frontend, shown with an empty demo account and simulated paper-mode
+response. No broker was connected, strategy generated, or order placed for this
+capture. The image does not demonstrate trading results.
+
 - Review generated strategies and their supporting research before creating agents.
 - Activate or pause agents and inspect their run history and streamed events.
 - View account balances, positions, and fill history for the selected account mode.
